@@ -152,8 +152,8 @@ esp_err_t microlink_factory_reset(void) {
  * ========================================================================== */
 
 microlink_t *microlink_init(const microlink_config_t *config) {
-    if (!config || !config->auth_key) {
-        ESP_LOGE(TAG, "Invalid config: auth_key required");
+    if (!config) {
+        ESP_LOGE(TAG, "Invalid config");
         return NULL;
     }
 
