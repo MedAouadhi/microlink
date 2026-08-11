@@ -1,0 +1,5 @@
+dependencies:
+  # ESP-IDF 6 removed its built-in `json` component. cJSON's public API is
+  # unchanged; consuming it through the component manager is the documented
+  # IDF 6 migration path.
+  espressif/cjson: "==1.7.19~2"
