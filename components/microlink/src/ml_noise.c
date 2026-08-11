@@ -17,7 +17,6 @@
 #include "microlink_internal.h"
 #include "esp_log.h"
 #include "esp_random.h"
-#include "mbedtls/chacha20.h"
 #include "mbedtls/chachapoly.h"
 #include <string.h>
 
