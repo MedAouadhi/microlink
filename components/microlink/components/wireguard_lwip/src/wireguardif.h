@@ -79,7 +79,11 @@ struct wireguardif_peer {
  * wg.listen_port = 51820;
  * wg.bind_netif = NULL; // Pass netif to listen on, NULL for all interfaces
  *
- * netif = netif_add(&netif_struct, &ipaddr, &netmask, &gateway, &wg, &wireguardif_init, &ip_input);
+ * netif = netif_add(&netif_struct, &ipaddr, &netmask, &gateway, &wg, &wireguardif_init, &tcpip_input);
+ *
+ * Pass tcpip_input rather than ip_input under NO_SYS=0 without core locking:
+ * decryption runs on whichever thread delivers the encrypted datagram, so
+ * ip_input here would mutate lwIP core state off the TCPIP thread.
  *
  * netif_set_up(wg_net);
  *

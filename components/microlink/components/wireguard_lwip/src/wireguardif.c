@@ -440,6 +440,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 	uint32_t now;
 	uint16_t header_len = 0xFFFF;
 	uint32_t idx = data_hdr->receiver;
+	netif_input_fn input_fn;
 
 	keypair = get_peer_keypair_for_idx(peer, idx);
 
@@ -537,11 +538,23 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 
 								// 5. If the plaintext packet has not been dropped, it is inserted into the receive queue of the wg0 interface.
 								if (dest_ok) {
-									// Send packet to be processed by LWIP
+									// Send packet to be processed by LWIP, through the netif's own
+									// input function rather than by calling ip_input() directly.
+									// This function runs on whichever thread delivered the encrypted
+									// datagram, which is not the TCPIP thread; a netif set up with
+									// tcpip_input therefore gets the decrypted packet posted to the
+									// TCPIP thread instead of having lwIP's core state mutated from
+									// here.  A netif set up with ip_input, as the documented example
+									// does, behaves exactly as before.
 									WG_DEBUG("[WG_RX_IP] Passing %u bytes to IP layer\n", (unsigned)pbuf->tot_len);
-									ip_input(pbuf, device->netif);
-									// pbuf is owned by IP layer now
-									pbuf = NULL;
+									input_fn = device->netif->input ? device->netif->input : ip_input;
+									if (input_fn(pbuf, device->netif) == ERR_OK) {
+										// pbuf is owned by the IP layer now
+										pbuf = NULL;
+									}
+									// Otherwise the packet was not accepted — tcpip_input returns
+									// ERR_MEM without taking the pbuf when the TCPIP mailbox is
+									// full — and the free below reclaims it.
 								} else {
 									WG_DEBUG("[WG_RX_IP] DROPPED: dest_ok=false\n");
 								}
