@@ -1162,10 +1162,10 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
     }
 
     /* Allocate PBUF_RAM and copy data so the pbuf OWNS its data.
-     * This is required because wireguardif decrypts in-place and then
-     * calls ip_input → tcpip_input which posts to the TCPIP thread.
-     * With PBUF_REF the backing data would be freed before the TCPIP
-     * thread processes the packet. */
+     * This is required because wireguardif decrypts in-place and then hands
+     * the plaintext to netif->input, which is tcpip_input here, so the packet
+     * is processed later on the TCPIP thread.  With PBUF_REF the backing data
+     * would be freed before the TCPIP thread got to it. */
     struct pbuf *p = pbuf_alloc(PBUF_RAW, pkt->len, PBUF_RAM);
     if (!p) {
         free(pkt->data);

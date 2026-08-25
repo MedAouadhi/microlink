@@ -5,9 +5,9 @@
 
 #include "wireguard-platform.h"
 #include "esp_random.h"
-#include "esp_timer.h"
 #include "lwip/sys.h"
 #include <string.h>
+#include <time.h>
 
 /* ============================================================================
  * Time Functions
@@ -20,10 +20,12 @@ uint32_t wireguard_sys_now() {
 
 void wireguard_tai64n_now(uint8_t *output) {
     // TAI64N format: 8 bytes seconds + 4 bytes nanoseconds
-    // For simplicity, use Unix epoch time
-    uint64_t now_us = esp_timer_get_time();
-    uint64_t seconds = now_us / 1000000ULL;
-    uint32_t nanoseconds = (now_us % 1000000ULL) * 1000;
+    // The application synchronizes the system clock with SNTP before starting
+    // MicroLink. A monotonic boot-time clock would replay after a reboot.
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    uint64_t seconds = (uint64_t)now.tv_sec;
+    uint32_t nanoseconds = (uint32_t)now.tv_nsec;
 
     // Log raw uptime before TAI offset (only every ~5s to avoid spam)
     static uint64_t last_log_s = 0;

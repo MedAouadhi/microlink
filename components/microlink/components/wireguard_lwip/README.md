@@ -65,8 +65,11 @@ You will need to implement a platform file that provides four functions
     	wg.listen_port = 51820;
     	wg.bind_netif = NULL;
 
-    	// Register the new WireGuard network interface with lwIP
-    	wg_netif = netif_add(&wg_netif_struct, &ipaddr, &netmask, &gateway, &wg, &wireguardif_init, &ip_input);
+    	// Register the new WireGuard network interface with lwIP.
+    	// Pass tcpip_input rather than ip_input under NO_SYS=0 without core
+    	// locking: decryption runs on whichever thread delivers the encrypted
+    	// datagram, so ip_input would mutate lwIP core state off the TCPIP thread.
+    	wg_netif = netif_add(&wg_netif_struct, &ipaddr, &netmask, &gateway, &wg, &wireguardif_init, &tcpip_input);
 
     	// Mark the interface as administratively up, link up flag is set automatically when peer connects
     	netif_set_up(wg_netif);

@@ -17,8 +17,7 @@
 #include "microlink_internal.h"
 #include "esp_log.h"
 #include "esp_random.h"
-#include "mbedtls/chacha20.h"
-#include "mbedtls/chachapoly.h"
+#include "psa/crypto.h"
 #include <string.h>
 
 static const char *TAG = "ml_noise";
@@ -145,6 +144,24 @@ static void noise_mix_key(uint8_t ck[32], uint8_t k[32], const uint8_t *dh_outpu
     noise_hkdf(ck, dh_output, 32, ck, k, NULL);
 }
 
+static int noise_import_chachapoly_key(const uint8_t *key, psa_key_id_t *key_id)
+{
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_status_t status = psa_crypto_init();
+
+    if (status != PSA_SUCCESS) {
+        return -1;
+    }
+
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_CHACHA20);
+    psa_set_key_bits(&attributes, 256);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT | PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attributes, PSA_ALG_CHACHA20_POLY1305);
+    status = psa_import_key(&attributes, key, 32, key_id);
+    psa_reset_key_attributes(&attributes);
+    return status == PSA_SUCCESS ? 0 : -1;
+}
+
 /* ============================================================================
  * ChaCha20-Poly1305 AEAD (Noise uses 64-bit nonce, padded to 96-bit)
  * ========================================================================== */
@@ -167,17 +184,18 @@ static int chacha20poly1305_encrypt(const uint8_t *key, uint64_t nonce,
     nonce_bytes[10] = (nonce >> 8) & 0xFF;
     nonce_bytes[11] = nonce & 0xFF;
 
-    mbedtls_chachapoly_context ctx;
-    mbedtls_chachapoly_init(&ctx);
-    mbedtls_chachapoly_setkey(&ctx, key);
-
     /* ciphertext layout: encrypted_data(pt_len) + tag(16) */
-    int ret = mbedtls_chachapoly_encrypt_and_tag(&ctx,
-                pt_len, nonce_bytes, ad, ad_len,
-                plaintext, ciphertext, ciphertext + pt_len);
-
-    mbedtls_chachapoly_free(&ctx);
-    return ret;
+    psa_key_id_t key_id = PSA_KEY_ID_NULL;
+    size_t output_len = 0;
+    if (noise_import_chachapoly_key(key, &key_id) != 0) {
+        return -1;
+    }
+    psa_status_t status = psa_aead_encrypt(key_id, PSA_ALG_CHACHA20_POLY1305,
+                                            nonce_bytes, sizeof(nonce_bytes), ad, ad_len,
+                                            plaintext, pt_len, ciphertext, pt_len + 16,
+                                            &output_len);
+    psa_destroy_key(key_id);
+    return status == PSA_SUCCESS && output_len == pt_len + 16 ? 0 : -1;
 }
 
 static int chacha20poly1305_decrypt(const uint8_t *key, uint64_t nonce,
@@ -199,18 +217,17 @@ static int chacha20poly1305_decrypt(const uint8_t *key, uint64_t nonce,
     nonce_bytes[11] = nonce & 0xFF;
 
     size_t payload_len = ct_len - 16;
-    const uint8_t *tag = ciphertext + payload_len;
-
-    mbedtls_chachapoly_context ctx;
-    mbedtls_chachapoly_init(&ctx);
-    mbedtls_chachapoly_setkey(&ctx, key);
-
-    int ret = mbedtls_chachapoly_auth_decrypt(&ctx,
-                payload_len, nonce_bytes, ad, ad_len,
-                tag, ciphertext, plaintext);
-
-    mbedtls_chachapoly_free(&ctx);
-    return ret;
+    psa_key_id_t key_id = PSA_KEY_ID_NULL;
+    size_t output_len = 0;
+    if (noise_import_chachapoly_key(key, &key_id) != 0) {
+        return -1;
+    }
+    psa_status_t status = psa_aead_decrypt(key_id, PSA_ALG_CHACHA20_POLY1305,
+                                            nonce_bytes, sizeof(nonce_bytes), ad, ad_len,
+                                            ciphertext, ct_len, plaintext, payload_len,
+                                            &output_len);
+    psa_destroy_key(key_id);
+    return status == PSA_SUCCESS && output_len == payload_len ? 0 : -1;
 }
 
 /* ============================================================================
