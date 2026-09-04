@@ -231,6 +231,27 @@ esp_err_t microlink_tcp_send(microlink_tcp_socket_t *sock, const void *data, siz
     return ESP_OK;
 }
 
+int microlink_tcp_poll_write(microlink_tcp_socket_t *sock, uint32_t timeout_ms) {
+    if (!sock || !sock->connected || sock->fd < 0) return -1;
+
+    fd_set writable;
+    FD_ZERO(&writable);
+    FD_SET(sock->fd, &writable);
+
+    struct timeval tv = {
+        .tv_sec = timeout_ms / 1000,
+        .tv_usec = (timeout_ms % 1000) * 1000,
+    };
+
+    int ready = select(sock->fd + 1, NULL, &writable, NULL, &tv);
+    if (ready < 0) {
+        ESP_LOGE(TAG, "TCP poll_write failed: errno=%d", errno);
+        sock->connected = false;
+        return -1;
+    }
+    return ready > 0 ? 1 : 0;
+}
+
 int microlink_tcp_recv(microlink_tcp_socket_t *sock, void *buffer, size_t len,
                         uint32_t timeout_ms) {
     if (!sock || !sock->connected || sock->fd < 0) return -1;

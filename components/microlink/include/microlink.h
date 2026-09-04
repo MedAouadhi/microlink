@@ -323,6 +323,25 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
 esp_err_t microlink_tcp_send(microlink_tcp_socket_t *sock, const void *data, size_t len);
 
 /**
+ * @brief Wait until the connection can accept a write
+ * @param sock Socket handle
+ * @param timeout_ms How long to wait for writability (0 polls and returns)
+ * @return 1 writable, 0 on timeout, -1 on error/disconnect
+ *
+ * The companion to microlink_tcp_send, which blocks until every byte is away
+ * and so cannot carry a deadline of its own: a send that returned early would
+ * have written part of a message, and a caller framing its own messages cannot
+ * recover from that. Asking here instead lets a caller give up before it starts
+ * a write, which is a whole message not sent rather than half of one.
+ *
+ * Writability means the socket has room, not that the peer has acknowledged
+ * anything. A send made straight after this returns 1 finds that room and does
+ * not block, provided what is written fits within it - lwIP reports a TCP
+ * socket writable only once at least TCP_SNDLOWAT bytes are free.
+ */
+int microlink_tcp_poll_write(microlink_tcp_socket_t *sock, uint32_t timeout_ms);
+
+/**
  * @brief Receive data from TCP connection
  * @param sock Socket handle
  * @param buffer Output buffer
