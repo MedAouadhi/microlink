@@ -180,6 +180,17 @@ typedef struct {
 #define ML_EVT_DERP_RECONNECT       BIT7
 #define ML_EVT_DERP_CONNECT_REQ     BIT8
 
+/* Set by each task as the last thing it does before deleting itself, so
+ * microlink_stop() can wait for the tasks rather than for a fixed time. */
+#define ML_EVT_EXITED_NET_IO        BIT9
+#define ML_EVT_EXITED_DERP          BIT10
+#define ML_EVT_EXITED_COORD         BIT11
+#define ML_EVT_EXITED_WG_MGR        BIT12
+
+/* How long microlink_stop() waits for the tasks. The slowest to notice is a
+ * coord task inside a DNS lookup, which cannot be interrupted. */
+#define ML_STOP_TIMEOUT_MS          30000
+
 /* ============================================================================
  * Queue Message Types
  * ========================================================================== */
@@ -346,6 +357,10 @@ struct microlink_s {
     TaskHandle_t derp_tx_task;
     TaskHandle_t coord_task;
     TaskHandle_t wg_mgr_task;
+
+    /* A stop that timed out leaves tasks that may still use this context, so
+     * microlink_destroy() leaks it rather than freeing it under them. */
+    bool stop_incomplete;
 
     /* Queues */
     QueueHandle_t derp_tx_queue;        /* -> derp_tx task */

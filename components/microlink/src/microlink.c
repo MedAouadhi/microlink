@@ -424,9 +424,26 @@ esp_err_t microlink_stop(microlink_t *ml) {
     /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST).
      * Tasks call vTaskDelete(NULL) to self-delete, so we must NOT call
      * vTaskDelete() on them again — that causes a crash in uxListRemove
-     * because the task's list node is already invalid. Just wait and
-     * NULL the handles. */
-    vTaskDelay(pdMS_TO_TICKS(3000));
+     * because the task's list node is already invalid. Each sets its exit
+     * bit last, so only the tasks that were started are waited for, and
+     * only for as long as they take. A fixed delay let a task still inside a
+     * DNS lookup or a TLS read outlive the context freed under it. */
+    EventBits_t started = 0;
+    if (ml->net_io_task)  started |= ML_EVT_EXITED_NET_IO;
+    if (ml->derp_tx_task) started |= ML_EVT_EXITED_DERP;
+    if (ml->coord_task)   started |= ML_EVT_EXITED_COORD;
+    if (ml->wg_mgr_task)  started |= ML_EVT_EXITED_WG_MGR;
+    if (started) {
+        EventBits_t exited = xEventGroupWaitBits(ml->events, started, pdFALSE, pdTRUE,
+                                                 pdMS_TO_TICKS(ML_STOP_TIMEOUT_MS));
+        if ((exited & started) != started) {
+            ESP_LOGE(TAG, "Tasks still running after %d ms (exited 0x%lx of 0x%lx)",
+                     ML_STOP_TIMEOUT_MS, (unsigned long)(exited & started),
+                     (unsigned long)started);
+            ml->stop_incomplete = true;
+            return ESP_ERR_TIMEOUT;
+        }
+    }
 
     ml->net_io_task = NULL;
     ml->derp_tx_task = NULL;
@@ -456,7 +473,10 @@ esp_err_t microlink_stop(microlink_t *ml) {
 void microlink_destroy(microlink_t *ml) {
     if (!ml) return;
 
-    microlink_stop(ml);
+    if (microlink_stop(ml) != ESP_OK && ml->stop_incomplete) {
+        ESP_LOGE(TAG, "Not freed: its tasks did not exit");
+        return;
+    }
 
     /* Deinitialize peer NVS */
     ml_peer_nvs_deinit();

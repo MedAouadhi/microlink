@@ -642,7 +642,12 @@ void ml_derp_tx_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
+    /* The TLS session and its socket are this task's: left open, each stop
+     * leaked an lwIP socket and the mbedTLS contexts. */
+    ml_derp_disconnect(ml);
+
     ESP_LOGI(TAG, "DERP I/O task exiting");
+    xEventGroupSetBits(ml->events, ML_EVT_EXITED_DERP);
     vTaskDelete(NULL);
 }
 
