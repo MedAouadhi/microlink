@@ -33,6 +33,8 @@
 #include "mbedtls/base64.h"
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 static const char *TAG = "ml_coord";
 
@@ -836,7 +838,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     {
         cJSON *netinfo = cJSON_CreateObject();
         if (netinfo) {
-            cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
+            cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->preferred_derp);
             cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
         }
     }
@@ -1139,7 +1141,10 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
         /* Parse self-node DERP region — try modern HomeDERP (int) first,
          * then fall back to legacy DERP string (format: "127.3.3.40:REGION") */
         cJSON *home_derp = cJSON_GetObjectItem(node, "HomeDERP");
-        if (home_derp && cJSON_IsNumber(home_derp) && home_derp->valueint > 0) {
+        if (ml->derp_measured) {
+            /* The server echoes the PreferredDERP we sent; a reply to a
+             * request sent before the measurement still has the old one. */
+        } else if (home_derp && cJSON_IsNumber(home_derp) && home_derp->valueint > 0) {
             ml->derp_home_region = (uint16_t)home_derp->valueint;
             ESP_LOGI(TAG, "Home DERP region: %d (from server, HomeDERP)", ml->derp_home_region);
         } else {
@@ -1512,7 +1517,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
      * to populate Node.HomeDERP for other peers. */
     cJSON *netinfo = cJSON_CreateObject();
     if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
+        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->preferred_derp);
         if (ml->stun_nat_checked) {
             cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
         }
@@ -1798,7 +1803,9 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
             /* Parse self-node DERP region — try modern HomeDERP (int) first,
              * then fall back to legacy DERP string (format: "127.3.3.40:REGION") */
             cJSON *home_derp = cJSON_GetObjectItem(node, "HomeDERP");
-            if (home_derp && cJSON_IsNumber(home_derp) && home_derp->valueint > 0) {
+            if (ml->derp_measured) {
+                /* Ours stands: see do_register() */
+            } else if (home_derp && cJSON_IsNumber(home_derp) && home_derp->valueint > 0) {
                 ml->derp_home_region = (uint16_t)home_derp->valueint;
                 ESP_LOGI(TAG, "Home DERP region: %d (from server, HomeDERP)", ml->derp_home_region);
             } else {
@@ -1994,7 +2001,7 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
      * to populate Node.HomeDERP for other peers. */
     cJSON *netinfo = cJSON_CreateObject();
     if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
+        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->preferred_derp);
         if (ml->stun_nat_checked) {
             cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
         }
@@ -2095,7 +2102,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
 
         cJSON *netinfo = cJSON_CreateObject();
         if (netinfo) {
-            cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
+            cJSON_AddNumberToObject(netinfo, "PreferredDERP", ml->preferred_derp);
             if (ml->stun_nat_checked) {
                 cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
             }
@@ -2293,6 +2300,113 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
 
     free(frame_buf);
     return 1;
+}
+
+/* ============================================================================
+ * Home DERP region: the nearest, by TCP connect time
+ *
+ * Peers that cannot reach this node directly relay through its home DERP
+ * region, so a far one adds its distance to every relayed packet: the
+ * compiled-in default is Dallas. Once the DERP map is known, a TCP connect
+ * to each region's first DERP node is timed, a few at a time, and the
+ * fastest becomes home. tailscaled measures with STUN over UDP; a TCP
+ * handshake costs one round trip too, and is what DERP rides on.
+ * ========================================================================== */
+
+#define DERP_PROBE_BATCH       6     /* sockets at once; lwIP has few */
+#define DERP_PROBE_TIMEOUT_MS  1500  /* per batch */
+#define DERP_PROBE_MARGIN_MS   15    /* not worth moving home for less */
+
+static uint16_t measure_derp_regions(microlink_t *ml, uint32_t *best_ms_out) {
+#ifdef CONFIG_ML_ENABLE_CELLULAR
+    if (ml_at_socket_is_ready()) return 0;  /* AT sockets have no select() */
+#endif
+    uint16_t best_region = 0;
+    uint32_t best_ms = UINT32_MAX;
+    uint32_t home_ms = UINT32_MAX;
+
+    for (int start = 0; start < ml->derp_region_count; start += DERP_PROBE_BATCH) {
+        int fds[DERP_PROBE_BATCH];
+        uint16_t ids[DERP_PROBE_BATCH];
+        int n = 0;
+        int64_t began = esp_timer_get_time();
+
+        for (int r = start; r < ml->derp_region_count && r < start + DERP_PROBE_BATCH; r++) {
+            const ml_derp_region_t *region = &ml->derp_regions[r];
+            if (region->avoid) continue;
+            const ml_derp_node_t *node = NULL;
+            for (int k = 0; k < region->node_count; k++) {
+                if (!region->nodes[k].stun_only && region->nodes[k].ipv4[0]) {
+                    node = &region->nodes[k];
+                    break;
+                }
+            }
+            if (!node) continue;
+            struct sockaddr_in to = {
+                .sin_family = AF_INET,
+                .sin_port = htons(node->derp_port ? node->derp_port : 443),
+            };
+            if (inet_pton(AF_INET, node->ipv4, &to.sin_addr) != 1) continue;
+            int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (fd < 0) break;  /* out of sockets: measure what we have */
+            fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+            if (connect(fd, (struct sockaddr *)&to, sizeof(to)) < 0 && errno != EINPROGRESS) {
+                close(fd);
+                continue;
+            }
+            fds[n] = fd;
+            ids[n] = region->region_id;
+            n++;
+        }
+
+        int open = n;
+        while (open > 0) {
+            int64_t left_us = (int64_t)DERP_PROBE_TIMEOUT_MS * 1000 - (esp_timer_get_time() - began);
+            if (left_us <= 0) break;
+            fd_set wset;
+            FD_ZERO(&wset);
+            int maxfd = -1;
+            for (int i = 0; i < n; i++) {
+                if (fds[i] >= 0) {
+                    FD_SET(fds[i], &wset);
+                    if (fds[i] > maxfd) maxfd = fds[i];
+                }
+            }
+            struct timeval tv = { .tv_sec = left_us / 1000000, .tv_usec = left_us % 1000000 };
+            if (select(maxfd + 1, NULL, &wset, NULL, &tv) <= 0) break;
+            uint32_t ms = (uint32_t)((esp_timer_get_time() - began) / 1000);
+            for (int i = 0; i < n; i++) {
+                if (fds[i] < 0 || !FD_ISSET(fds[i], &wset)) continue;
+                int err = 0;
+                socklen_t len = sizeof(err);
+                getsockopt(fds[i], SOL_SOCKET, SO_ERROR, &err, &len);
+                if (err == 0) {
+                    ESP_LOGD(TAG, "DERP region %d: %lu ms", ids[i], (unsigned long)ms);
+                    if (ms < best_ms) {
+                        best_ms = ms;
+                        best_region = ids[i];
+                    }
+                    if (ids[i] == ml->preferred_derp) home_ms = ms;
+                }
+                close(fds[i]);
+                fds[i] = -1;
+                open--;
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            if (fds[i] >= 0) close(fds[i]);
+        }
+        if (xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST) return 0;
+    }
+
+    if (best_region == 0) return 0;
+    /* Stay put unless the difference is worth a move */
+    if (home_ms != UINT32_MAX && home_ms <= best_ms + DERP_PROBE_MARGIN_MS) {
+        best_region = ml->preferred_derp;
+        best_ms = home_ms;
+    }
+    if (best_ms_out) *best_ms_out = best_ms;
+    return best_region;
 }
 
 /* ============================================================================
@@ -2505,6 +2619,27 @@ void ml_coord_task(void *arg) {
             /* A peer map means the node is accepted, whatever the
              * RegisterResponse carried */
             ml->registered = true;
+
+            /* The map brought the DERP regions: find the nearest before DERP
+             * first connects, so it connects there. The long poll below
+             * reports it. */
+            if (!ml->derp_measured && ml->config.derp_region == 0 && ml->derp_region_count > 0) {
+                int64_t t_probe = esp_timer_get_time();
+                uint32_t ms = 0;
+                uint16_t best = measure_derp_regions(ml, &ms);
+                ml->derp_measured = true;
+                if (best) {
+                    ESP_LOGI(TAG, "Home DERP region %d, %lu ms away (measured in %lld ms)",
+                             best, (unsigned long)ms, (esp_timer_get_time() - t_probe) / 1000);
+                    if (best != ml->preferred_derp) {
+                        ml->preferred_derp = best;
+                        ml_derp_region_store(best);
+                    }
+                } else {
+                    ESP_LOGW(TAG, "No DERP region answered; home stays %d", ml->preferred_derp);
+                }
+                ml->derp_home_region = ml->preferred_derp;
+            }
             xEventGroupSetBits(ml->events, ML_EVT_COORD_REGISTERED);
 
             /* Signal DERP I/O task to connect (connection now owned by I/O task) */

@@ -446,6 +446,8 @@ struct microlink_s {
     ml_derp_region_t derp_regions[ML_MAX_DERP_REGIONS];
     uint8_t derp_region_count;
     uint16_t derp_home_region;      /* Our PreferredDERP region */
+    uint16_t preferred_derp;        /* What we report as PreferredDERP */
+    bool derp_measured;             /* preferred_derp was measured this run */
 
     /* Key expiry (parsed from MapResponse self-node) */
     int64_t key_expiry_epoch;       /* Unix epoch seconds, 0 = no expiry */
@@ -572,6 +574,9 @@ esp_err_t ml_node_key_rotate(microlink_t *ml, bool apply_now);
 
 /* Drop the OldNodeKey once its successor has been authorised. */
 void ml_node_key_forget_old(microlink_t *ml);
+
+/* Remember the measured home DERP region for the next start. */
+void ml_derp_region_store(uint16_t region);
 
 /* ============================================================================
  * Network Socket Wrappers — Route through AT sockets when cellular active

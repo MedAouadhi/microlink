@@ -45,6 +45,11 @@ typedef struct {
     uint32_t disco_heartbeat_ms;    /* DISCO keepalive interval (default: 3000) */
     uint32_t stun_interval_ms;      /* STUN re-probe interval (default: 23000) */
     uint32_t ctrl_watchdog_ms;      /* Control plane watchdog timeout (default: 120000) */
+
+    /* The DERP region to use as home, which peers relay through to reach
+     * this node. 0: the nearest, measured once a run when the DERP map
+     * arrives and remembered in NVS for the next start. */
+    uint16_t derp_region;
 } microlink_config_t;
 
 /* Peer info (read-only snapshot) */

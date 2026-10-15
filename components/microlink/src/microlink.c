@@ -35,6 +35,7 @@ static const char *TAG = "microlink";
 #define NVS_KEY_DISCO_PRI   "disco_pri"
 #define NVS_KEY_DISCO_PUB   "disco_pub"
 #define NVS_KEY_WG_OLD_PUB  "wg_old_pub"
+#define NVS_KEY_DERP_HOME   "derp_home"
 
 /* X25519 from x25519.h */
 #include "x25519.h"
@@ -154,6 +155,25 @@ esp_err_t ml_node_key_rotate(microlink_t *ml, bool apply_now) {
     return err;
 }
 
+void ml_derp_region_store(uint16_t region) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u16(nvs, NVS_KEY_DERP_HOME, region);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+}
+
+static uint16_t derp_region_load(void) {
+    nvs_handle_t nvs;
+    uint16_t region = 0;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+        nvs_get_u16(nvs, NVS_KEY_DERP_HOME, &region);
+        nvs_close(nvs);
+    }
+    return region;
+}
+
 void ml_node_key_forget_old(microlink_t *ml) {
     if (!ml->has_old_node_key) return;
     nvs_handle_t nvs;
@@ -256,6 +276,13 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         free(ml);
         return NULL;
     }
+
+    /* Home DERP region: the caller's, else the nearest found last time */
+    ml->preferred_derp = ml->config.derp_region;
+    if (ml->preferred_derp == 0) ml->preferred_derp = derp_region_load();
+    if (ml->preferred_derp == 0) ml->preferred_derp = ML_DERP_REGION;
+    ESP_LOGI(TAG, "Home DERP region %d%s", ml->preferred_derp,
+             ml->config.derp_region ? " (set)" : "");
 
     /* Initialize peer NVS cache */
     ml_peer_nvs_init();
