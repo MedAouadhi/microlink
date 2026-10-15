@@ -500,6 +500,13 @@ esp_err_t microlink_stop(microlink_t *ml) {
 
     ESP_LOGI(TAG, "Stopping...");
     xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
+    /* The coord task waits on its command queue between attempts, up to
+     * 30 s while an admin's approval or a reconnect is awaited: a command
+     * ends that wait, where the shutdown bit alone would not. */
+    if (ml->coord_cmd_queue) {
+        ml_coord_cmd_t cmd = ML_CMD_DISCONNECT;
+        xQueueSend(ml->coord_cmd_queue, &cmd, 0);
+    }
 
     /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST).
      * Tasks call vTaskDelete(NULL) to self-delete, so we must NOT call
@@ -580,6 +587,13 @@ void microlink_destroy(microlink_t *ml) {
     ml_peer_update_t *update;
     while (ml->peer_update_queue && xQueueReceive(ml->peer_update_queue, &update, 0) == pdTRUE) {
         free(update);
+    }
+    /* The DERP task drains its own queue as it exits, but the WG manager's
+     * last pass, or the TCPIP thread routing into the netif, can queue more
+     * after that. */
+    ml_derp_tx_item_t tx_item;
+    while (ml->derp_tx_queue && xQueueReceive(ml->derp_tx_queue, &tx_item, 0) == pdTRUE) {
+        free(tx_item.data);
     }
 
     /* Delete queues */
