@@ -37,6 +37,18 @@ static const char *TAG = "ml_derp";
 /* Timeout for DERP connection handshake operations */
 #define DERP_CONNECT_TIMEOUT_MS  10000
 
+#if MBEDTLS_VERSION_MAJOR < 4
+/* mbedTLS 3 (ESP-IDF 5) refuses a handshake without an RNG on the config;
+ * mbedTLS 4 takes its randomness from PSA instead. esp_fill_random() is the
+ * hardware source, and has the shape mbedTLS asks for. */
+static int ml_derp_rng(void *context, unsigned char *output, size_t length)
+{
+    (void)context;
+    esp_fill_random(output, length);
+    return 0;
+}
+#endif
+
 /* ============================================================================
  * Custom BIO callbacks for non-blocking TLS I/O
  *
@@ -717,7 +729,11 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
                                  MBEDTLS_SSL_TRANSPORT_STREAM,
                                  MBEDTLS_SSL_PRESET_DEFAULT);
     mbedtls_ssl_conf_authmode(&ml->derp.ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
+#if MBEDTLS_VERSION_MAJOR < 4
+    mbedtls_ssl_conf_rng(&ml->derp.ssl_conf, ml_derp_rng, NULL);
+#else
     /* mbedTLS 4 obtains TLS randomness through its PSA crypto backend. */
+#endif
     mbedtls_ssl_conf_read_timeout(&ml->derp.ssl_conf, DERP_CONNECT_TIMEOUT_MS);
 
     mbedtls_ssl_setup(&ml->derp.ssl, &ml->derp.ssl_conf);

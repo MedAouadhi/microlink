@@ -17,7 +17,14 @@
 #include "microlink_internal.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "mbedtls/build_info.h"
+#if MBEDTLS_VERSION_MAJOR >= 4
 #include "psa/crypto.h"
+#else
+/* mbedTLS 3 (ESP-IDF 5) has the one-shot ChaCha20-Poly1305 API that
+ * mbedTLS 4 removed, and needs no PSA initialisation to use it. */
+#include "mbedtls/chachapoly.h"
+#endif
 #include <string.h>
 
 static const char *TAG = "ml_noise";
@@ -144,6 +151,7 @@ static void noise_mix_key(uint8_t ck[32], uint8_t k[32], const uint8_t *dh_outpu
     noise_hkdf(ck, dh_output, 32, ck, k, NULL);
 }
 
+#if MBEDTLS_VERSION_MAJOR >= 4
 static int noise_import_chachapoly_key(const uint8_t *key, psa_key_id_t *key_id)
 {
     psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
@@ -161,6 +169,7 @@ static int noise_import_chachapoly_key(const uint8_t *key, psa_key_id_t *key_id)
     psa_reset_key_attributes(&attributes);
     return status == PSA_SUCCESS ? 0 : -1;
 }
+#endif
 
 /* ============================================================================
  * ChaCha20-Poly1305 AEAD (Noise uses 64-bit nonce, padded to 96-bit)
@@ -185,6 +194,7 @@ static int chacha20poly1305_encrypt(const uint8_t *key, uint64_t nonce,
     nonce_bytes[11] = nonce & 0xFF;
 
     /* ciphertext layout: encrypted_data(pt_len) + tag(16) */
+#if MBEDTLS_VERSION_MAJOR >= 4
     psa_key_id_t key_id = PSA_KEY_ID_NULL;
     size_t output_len = 0;
     if (noise_import_chachapoly_key(key, &key_id) != 0) {
@@ -196,6 +206,17 @@ static int chacha20poly1305_encrypt(const uint8_t *key, uint64_t nonce,
                                             &output_len);
     psa_destroy_key(key_id);
     return status == PSA_SUCCESS && output_len == pt_len + 16 ? 0 : -1;
+#else
+    mbedtls_chachapoly_context ctx;
+    mbedtls_chachapoly_init(&ctx);
+    int ret = mbedtls_chachapoly_setkey(&ctx, key);
+    if (ret == 0) {
+        ret = mbedtls_chachapoly_encrypt_and_tag(&ctx, pt_len, nonce_bytes, ad, ad_len,
+                                                 plaintext, ciphertext, ciphertext + pt_len);
+    }
+    mbedtls_chachapoly_free(&ctx);
+    return ret == 0 ? 0 : -1;
+#endif
 }
 
 static int chacha20poly1305_decrypt(const uint8_t *key, uint64_t nonce,
@@ -217,6 +238,7 @@ static int chacha20poly1305_decrypt(const uint8_t *key, uint64_t nonce,
     nonce_bytes[11] = nonce & 0xFF;
 
     size_t payload_len = ct_len - 16;
+#if MBEDTLS_VERSION_MAJOR >= 4
     psa_key_id_t key_id = PSA_KEY_ID_NULL;
     size_t output_len = 0;
     if (noise_import_chachapoly_key(key, &key_id) != 0) {
@@ -228,6 +250,17 @@ static int chacha20poly1305_decrypt(const uint8_t *key, uint64_t nonce,
                                             &output_len);
     psa_destroy_key(key_id);
     return status == PSA_SUCCESS && output_len == payload_len ? 0 : -1;
+#else
+    mbedtls_chachapoly_context ctx;
+    mbedtls_chachapoly_init(&ctx);
+    int ret = mbedtls_chachapoly_setkey(&ctx, key);
+    if (ret == 0) {
+        ret = mbedtls_chachapoly_auth_decrypt(&ctx, payload_len, nonce_bytes, ad, ad_len,
+                                              ciphertext + payload_len, ciphertext, plaintext);
+    }
+    mbedtls_chachapoly_free(&ctx);
+    return ret == 0 ? 0 : -1;
+#endif
 }
 
 /* ============================================================================
