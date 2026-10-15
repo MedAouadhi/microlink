@@ -198,6 +198,11 @@ typedef struct {
 /* How often a node waiting for an admin's approval asks again. */
 #define ML_APPROVAL_RECHECK_MS      30000
 
+/* A sign-in URL is followed for this long, or until this many registrations
+ * following it fail, and then the client asks for a new one. */
+#define ML_LOGIN_URL_MAX_MS         (30 * 60 * 1000)
+#define ML_LOGIN_FOLLOWUP_FAILURES  3
+
 /* ============================================================================
  * Queue Message Types
  * ========================================================================== */
@@ -374,6 +379,8 @@ struct microlink_s {
      * writes these; callers read them under reg_lock. */
     portMUX_TYPE reg_lock;
     char auth_url[192];             /* "" unless a login is pending */
+    uint64_t auth_url_since_ms;     /* when the control plane gave it */
+    uint8_t followup_failures;      /* registrations following it that failed */
     char last_error[128];
     microlink_error_t last_error_code;
     volatile bool registered;       /* authorised since start */

@@ -110,9 +110,15 @@ enum {
 /* Record what the control plane said, for microlink_get_auth_url() and
  * microlink_get_error(). */
 static void coord_set_auth_url(microlink_t *ml, const char *url) {
+    if (!url) url = "";
     taskENTER_CRITICAL(&ml->reg_lock);
-    strlcpy(ml->auth_url, url ? url : "", sizeof(ml->auth_url));
+    bool changed = strcmp(ml->auth_url, url) != 0;
+    strlcpy(ml->auth_url, url, sizeof(ml->auth_url));
     taskEXIT_CRITICAL(&ml->reg_lock);
+    if (changed) {
+        ml->auth_url_since_ms = url[0] ? ml_get_time_ms() : 0;
+        ml->followup_failures = 0;
+    }
 }
 
 static void coord_set_error(microlink_t *ml, microlink_error_t code, const char *text) {
@@ -823,6 +829,17 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     taskENTER_CRITICAL(&ml->reg_lock);
     strlcpy(followup, ml->auth_url, sizeof(followup));
     taskEXIT_CRITICAL(&ml->reg_lock);
+    /* An old URL, or one the control plane keeps failing on, may have been
+     * forgotten there: ask for a new one rather than follow it for ever */
+    if (followup[0] &&
+        (ml_get_time_ms() - ml->auth_url_since_ms > ML_LOGIN_URL_MAX_MS ||
+         ml->followup_failures >= ML_LOGIN_FOLLOWUP_FAILURES)) {
+        ESP_LOGW(TAG, "Sign-in URL given up after %lu s and %d failures; asking for a new one",
+                 (unsigned long)((ml_get_time_ms() - ml->auth_url_since_ms) / 1000),
+                 ml->followup_failures);
+        coord_set_auth_url(ml, NULL);
+        followup[0] = '\0';
+    }
     if (followup[0]) {
         cJSON_AddStringToObject(root, "Followup", followup);
     }
@@ -2322,7 +2339,13 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
  * handshake costs one round trip too, and is what DERP rides on.
  * ========================================================================== */
 
-#define DERP_PROBE_BATCH       6     /* sockets at once; lwIP has few */
+#define DERP_PROBE_BATCH       4     /* sockets at once; lwIP has 16 for all */
+#define DERP_PROBE_EVERY_MS    (60 * 60 * 1000)
+
+/* When this boot last measured. The client is started again at every change
+ * of network, and a probe is some 30 connects and up to a few seconds
+ * before DERP connects; the region found is kept in NVS meanwhile. */
+static uint64_t s_derp_probed_ms;
 #define DERP_PROBE_TIMEOUT_MS  1500  /* per batch */
 #define DERP_PROBE_MARGIN_MS   15    /* not worth moving home for less */
 
@@ -2573,6 +2596,7 @@ void ml_coord_task(void *arg) {
             memset(&noise, 0, sizeof(noise));
             if (reg < 0) {
                 ESP_LOGE(TAG, "Registration failed");
+                if (coord_login_pending(ml)) ml->followup_failures++;
                 state = COORD_RECONNECTING;
                 break;
             }
@@ -2641,12 +2665,20 @@ void ml_coord_task(void *arg) {
             /* The map brought the DERP regions: find the nearest before DERP
              * first connects, so it connects there. The long poll below
              * reports it. */
+            if (!ml->derp_measured && ml->config.derp_region == 0 && ml->derp_region_count > 0 &&
+                s_derp_probed_ms && ml_get_time_ms() - s_derp_probed_ms < DERP_PROBE_EVERY_MS) {
+                ESP_LOGI(TAG, "Home DERP region %d, measured %lu min ago", ml->preferred_derp,
+                         (unsigned long)((ml_get_time_ms() - s_derp_probed_ms) / 60000));
+                ml->derp_measured = true;
+                ml->derp_home_region = ml->preferred_derp;
+            }
             if (!ml->derp_measured && ml->config.derp_region == 0 && ml->derp_region_count > 0) {
                 int64_t t_probe = esp_timer_get_time();
                 uint32_t ms = 0;
                 uint16_t best = measure_derp_regions(ml, &ms);
                 ml->derp_measured = true;
                 if (best) {
+                    s_derp_probed_ms = ml_get_time_ms();
                     ESP_LOGI(TAG, "Home DERP region %d, %lu ms away (measured in %lld ms)",
                              best, (unsigned long)ms, (esp_timer_get_time() - t_probe) / 1000);
                     if (best != ml->preferred_derp) {

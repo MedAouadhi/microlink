@@ -1651,9 +1651,11 @@ void ml_wg_mgr_task(void *arg) {
             for (int i = 0; i < ml->peer_count; i++) {
                 ml_peer_t *p = &ml->peers[i];
                 if (!p->active || p->wg_peer_index < 0) continue;
+                /* Within the 5 s the flag waits, rather than being taken
+                 * and lost: a SYN sent again in the meantime still counts */
+                if (p->last_session_ask_ms && ask_now - p->last_session_ask_ms < 5000) continue;
                 if (!wireguardif_take_wants_session((struct netif *)ml->wg_netif,
                                                     (u8_t)p->wg_peer_index)) continue;
-                if (p->last_session_ask_ms && ask_now - p->last_session_ask_ms < 5000) continue;
                 p->last_session_ask_ms = ask_now;
                 ESP_LOGI(TAG, "A packet for %s found no session; starting one", p->hostname);
                 ml_wg_mgr_trigger_handshake(ml, p->vpn_ip);
