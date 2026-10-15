@@ -1615,6 +1615,27 @@ void ml_wg_mgr_task(void *arg) {
             process_wg_packet(ml, &wg_pkt);
         }
 
+        /* A packet to a peer found no WireGuard session: start one the way
+         * microlink_tcp_connect() does, through DERP and the direct path
+         * DISCO found, so a plain socket reaches a peer that has not reached
+         * us first. wireguard-lwip alone would send it to the peer's first
+         * endpoint, often an address behind a NAT that does not hairpin. At
+         * most every REKEY_TIMEOUT, as WireGuard spaces initiations. */
+        if (ml->wg_netif) {
+            uint64_t ask_now = ml_get_time_ms();
+            for (int i = 0; i < ml->peer_count; i++) {
+                ml_peer_t *p = &ml->peers[i];
+                if (!p->active || p->wg_peer_index < 0) continue;
+                if (!wireguardif_take_wants_session((struct netif *)ml->wg_netif,
+                                                    (u8_t)p->wg_peer_index)) continue;
+                if (p->last_session_ask_ms && ask_now - p->last_session_ask_ms < 5000) continue;
+                p->last_session_ask_ms = ask_now;
+                ESP_LOGI(TAG, "A packet for %s found no session; starting one", p->hostname);
+                ml_wg_mgr_trigger_handshake(ml, p->vpn_ip);
+                ml_wg_mgr_send_cmm(ml, p->vpn_ip);
+            }
+        }
+
         /* Run WireGuard periodic processing (handshakes, keepalives, rekeys).
          * This runs on OUR task stack (8KB) instead of the lwIP TCPIP thread (3-8KB),
          * preventing heavy crypto (X25519, ChaCha20-Poly1305) from monopolizing

@@ -64,6 +64,7 @@
 
 // Forward declaration for timer cancellation in wireguardif_shutdown
 static void wireguardif_tmr(void *arg);
+static err_t wireguardif_lookup_peer(struct netif *netif, u8_t peer_index, struct wireguard_peer **out);
 
 // Flag to disable internal UDP socket binding (for magicsock mode)
 static bool g_disable_socket_bind = false;
@@ -316,13 +317,30 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 		} else {
 			// key has expired...
 			keypair_destroy(keypair);
+			peer->wants_session = true;
 			result = ERR_CONN;
 		}
 	} else {
-		// No valid keys!
+		// No valid keys! WireGuard starts a handshake when a packet finds no
+		// session; without one a socket could only reach a peer that had
+		// reached us first. Which path to try is the application's to say
+		// (DERP, or what DISCO found), and the crypto is too heavy for this
+		// thread, so this only flags it. This packet is dropped; TCP sends
+		// its SYN again, and that one finds the session.
+		peer->wants_session = true;
 		result = ERR_CONN;
 	}
 	return result;
+}
+
+bool wireguardif_take_wants_session(struct netif *netif, u8_t peer_index) {
+	struct wireguard_peer *peer;
+	if (!netif || !netif->state || wireguardif_lookup_peer(netif, peer_index, &peer) != ERR_OK) {
+		return false;
+	}
+	bool wants = peer->wants_session;
+	peer->wants_session = false;
+	return wants;
 }
 
 // This is used as the output function for the Wireguard netif

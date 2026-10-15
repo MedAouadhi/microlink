@@ -276,6 +276,7 @@ typedef struct {
     uint64_t trust_until_ms;        /* Direct path trusted until */
     uint64_t last_send_ms;          /* Last data sent to this peer */
     uint64_t last_upgrade_ms;       /* Last path upgrade attempt */
+    uint64_t last_session_ask_ms;   /* Last handshake a dropped packet asked for */
 
     /* Best direct path */
     uint32_t best_ip;

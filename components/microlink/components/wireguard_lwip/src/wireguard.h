@@ -180,6 +180,10 @@ struct wireguard_peer {
 
 	// We set this flag on RX/TX of packets if we think that we should initiate a new handshake
 	bool send_handshake;
+
+	// Set when a packet for this peer was dropped for want of a session, for
+	// whoever owns the paths to start one (wireguardif_take_wants_session)
+	bool wants_session;
 };
 
 struct wireguard_device {

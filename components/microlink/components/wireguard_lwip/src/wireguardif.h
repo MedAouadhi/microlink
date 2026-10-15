@@ -144,6 +144,10 @@ void wireguardif_set_derp_output(struct netif *netif, wireguard_derp_output_fn f
 // The handshake will be routed through the DERP callback if set
 err_t wireguardif_connect_derp(struct netif *netif, u8_t peer_index);
 
+// Whether a packet for the peer was dropped for want of a session since the
+// last call; clears it. The caller starts one the way it reaches the peer.
+bool wireguardif_take_wants_session(struct netif *netif, u8_t peer_index);
+
 // Inject a received packet into the WireGuard interface (for magicsock demux)
 // This allows an external unified socket to receive all packets and route
 // WireGuard packets to this interface. The packet data is copied internally.
