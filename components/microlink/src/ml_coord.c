@@ -90,6 +90,57 @@ typedef enum {
     COORD_RECONNECTING,
 } coord_state_t;
 
+/* What the control plane made of a RegisterRequest. Negative is a transport
+ * failure, retried with backoff; 0 lets the client carry on to the map. */
+enum {
+    REG_AUTHORIZED = 0,
+    REG_NEEDS_LOGIN,      /* an AuthURL to sign in at */
+    REG_LOGIN_WAITING,    /* followed the AuthURL; nobody has signed in yet */
+    REG_NEEDS_APPROVAL,   /* signed in, not yet approved by an admin */
+    REG_REFUSED,          /* Error: the same request will not succeed */
+    REG_KEY_EXPIRED,      /* NodeKeyExpired: a new node key must sign in */
+};
+
+/* noise_recv(): nothing had arrived when the socket's timeout ran out, and
+ * nothing was consumed, so the stream is still aligned. */
+#define NOISE_RECV_TIMEOUT (-2)
+
+/* Record what the control plane said, for microlink_get_auth_url() and
+ * microlink_get_error(). */
+static void coord_set_auth_url(microlink_t *ml, const char *url) {
+    taskENTER_CRITICAL(&ml->reg_lock);
+    strlcpy(ml->auth_url, url ? url : "", sizeof(ml->auth_url));
+    taskEXIT_CRITICAL(&ml->reg_lock);
+}
+
+static void coord_set_error(microlink_t *ml, microlink_error_t code, const char *text) {
+    taskENTER_CRITICAL(&ml->reg_lock);
+    ml->last_error_code = code;
+    strlcpy(ml->last_error, text ? text : "", sizeof(ml->last_error));
+    taskEXIT_CRITICAL(&ml->reg_lock);
+}
+
+static bool coord_login_pending(microlink_t *ml) {
+    taskENTER_CRITICAL(&ml->reg_lock);
+    bool pending = ml->auth_url[0] != '\0';
+    taskEXIT_CRITICAL(&ml->reg_lock);
+    return pending;
+}
+
+/* Move to a state the application has to act on, and tell it. */
+static void coord_announce(microlink_t *ml, microlink_state_t state) {
+    bool changed = ml->state != state;
+    ml->state = state;
+    if (changed && ml->state_cb) {
+        ml->state_cb(ml, state, ml->state_cb_data);
+    }
+}
+
+static void coord_set_rcvtimeo(microlink_t *ml, uint32_t ms) {
+    struct timeval tv = { .tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000 };
+    ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
 /* ============================================================================
  * Helper: hex encoding for keys
  * ========================================================================== */
@@ -152,6 +203,9 @@ static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
                 if (++retries > 300) {  /* ~3 seconds */
                     ESP_LOGE(TAG, "coord_recv partial timeout: %d/%d bytes",
                              (int)recvd, (int)len);
+                    /* Not EAGAIN: bytes were consumed, so the stream is no
+                     * longer aligned and asking again cannot help. */
+                    errno = ETIMEDOUT;
                     return -1;
                 }
                 vTaskDelay(pdMS_TO_TICKS(10));
@@ -201,7 +255,12 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
                         uint8_t *plaintext, size_t max_len) {
     /* Read 3-byte frame header */
     uint8_t hdr[3];
-    if (coord_recv(ml, hdr, 3) < 0) return -1;
+    errno = 0;
+    if (coord_recv(ml, hdr, 3) < 0) {
+        /* coord_recv() consumed nothing if it timed out before the first
+         * byte, so the caller may simply ask again. errno stays EAGAIN. */
+        return (errno == EAGAIN || errno == EWOULDBLOCK) ? NOISE_RECV_TIMEOUT : -1;
+    }
 
     if (hdr[0] != 0x04) {
         ESP_LOGE(TAG, "Unexpected Noise frame type: 0x%02x", hdr[0]);
@@ -231,6 +290,7 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
         ESP_LOGE(TAG, "noise_recv payload failed: ct_len=%d retries=%d errno=%d",
                  ct_len, payload_retries, errno);
         free(ciphertext);
+        errno = EIO;  /* the header is consumed: not a timeout to retry */
         return -1;
     }
 
@@ -736,6 +796,26 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     snprintf(key_str, sizeof(key_str), "nodekey:%s", key_hex);
     cJSON_AddStringToObject(root, "NodeKey", key_str);
 
+    /* The key this one replaces, so the control plane moves the node to it
+     * rather than making a new node */
+    if (ml->has_old_node_key) {
+        char old_hex[65];
+        char old_str[80];
+        bytes_to_hex(ml->old_node_key, 32, old_hex);
+        snprintf(old_str, sizeof(old_str), "nodekey:%s", old_hex);
+        cJSON_AddStringToObject(root, "OldNodeKey", old_str);
+    }
+
+    /* Following a login URL: the control plane answers this request once
+     * someone has signed in there, or with a new URL */
+    char followup[sizeof(ml->auth_url)];
+    taskENTER_CRITICAL(&ml->reg_lock);
+    strlcpy(followup, ml->auth_url, sizeof(followup));
+    taskEXIT_CRITICAL(&ml->reg_lock);
+    if (followup[0]) {
+        cJSON_AddStringToObject(root, "Followup", followup);
+    }
+
     /* Auth - only include if auth_key is valid (matching v1 behavior) */
     if (ml->config.auth_key && strlen(ml->config.auth_key) > 0) {
         cJSON *auth = cJSON_CreateObject();
@@ -842,12 +922,24 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
      * Scan each frame for H2 END_STREAM on stream 1 to break early
      * instead of blocking 60s waiting for more data that won't come. */
     bool got_register_end = false;
+    bool login_waiting = false;
+    uint64_t wait_start_ms = ml_get_time_ms();
+    if (followup[0]) {
+        /* Wait in one-second steps, so a stop is noticed */
+        coord_set_rcvtimeo(ml, 1000);
+    }
     for (int frame_count = 0; frame_count < 10 && !got_register_end; frame_count++) {
         uint8_t *frame_buf = ml_psram_malloc(4096);
         if (!frame_buf) break;
 
         int frame_len = noise_recv(ml, noise, frame_buf, 4096);
+        while (followup[0] && frame_len == NOISE_RECV_TIMEOUT &&
+               !(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST) &&
+               ml_get_time_ms() - wait_start_ms < ML_LOGIN_WAIT_MS) {
+            frame_len = noise_recv(ml, noise, frame_buf, 4096);
+        }
         if (frame_len <= 0) {
+            login_waiting = followup[0] && frame_len == NOISE_RECV_TIMEOUT;
             free(frame_buf);
             break;
         }
@@ -922,7 +1014,17 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
         noise_send(ml, noise, wu_buf, wu_len);
     }
 
+    if (followup[0]) {
+        coord_set_rcvtimeo(ml, 10000);  /* do_tcp_connect()'s */
+    }
+
     ESP_LOGI(TAG, "RegisterResponse: %d bytes total data", (int)resp_total);
+
+    if (resp_total == 0 && login_waiting) {
+        free(resp_buf);
+        ESP_LOGI(TAG, "Nobody has signed in yet; asking again");
+        return REG_LOGIN_WAITING;
+    }
 
     if (resp_total == 0) {
         ESP_LOGW(TAG, "No DATA frame in RegisterResponse");
@@ -976,6 +1078,47 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     }
     parse_start[parse_len] = saved;
     free(resp_buf);
+
+    /* What the control plane decided. A reply without these fields keeps the
+     * old behaviour of carrying on to the map. */
+    int result = REG_AUTHORIZED;
+    {
+        cJSON *error = cJSON_GetObjectItem(resp_json, "Error");
+        cJSON *auth_url = cJSON_GetObjectItem(resp_json, "AuthURL");
+        cJSON *authorized = cJSON_GetObjectItem(resp_json, "MachineAuthorized");
+        cJSON *expired = cJSON_GetObjectItem(resp_json, "NodeKeyExpired");
+
+        if (cJSON_IsString(error) && error->valuestring[0]) {
+            ESP_LOGE(TAG, "Registration refused: %s", error->valuestring);
+            coord_set_error(ml, ML_ERROR_REFUSED, error->valuestring);
+            result = REG_REFUSED;
+        } else if (cJSON_IsTrue(expired)) {
+            ESP_LOGW(TAG, "The control plane says the node key has expired");
+            result = REG_KEY_EXPIRED;
+        } else if (cJSON_IsString(auth_url) && auth_url->valuestring[0] &&
+                   !cJSON_IsTrue(authorized)) {
+            ESP_LOGI(TAG, "Sign in at %s", auth_url->valuestring);
+            coord_set_auth_url(ml, auth_url->valuestring);
+            result = REG_NEEDS_LOGIN;
+        } else if (cJSON_IsFalse(authorized)) {
+            ESP_LOGI(TAG, "Signed in; waiting for an admin to approve this node");
+            coord_set_auth_url(ml, NULL);
+            result = REG_NEEDS_APPROVAL;
+        }
+    }
+    if (result != REG_AUTHORIZED) {
+        cJSON_Delete(resp_json);
+        return result;
+    }
+
+    /* Authorised. An auth key is spent now, so it is never sent again: a
+     * reconnect registers the node key alone. */
+    ml->registered = true;
+    coord_set_auth_url(ml, NULL);
+    coord_set_error(ml, ML_ERROR_NONE, NULL);
+    ml->config.auth_key = NULL;
+    memset(ml->nvs_auth_key, 0, sizeof(ml->nvs_auth_key));
+    ml_node_key_forget_old(ml);
 
     /* Extract our VPN IP from Node.Addresses */
     cJSON *node = cJSON_GetObjectItem(resp_json, "Node");
@@ -2257,7 +2400,10 @@ void ml_coord_task(void *arg) {
             break;
 
         case COORD_NOISE_HANDSHAKE:
-            ml->state = ML_STATE_REGISTERING;
+            /* A login or an approval being waited on stays on show */
+            if (!coord_login_pending(ml) && ml->state != ML_STATE_NEEDS_APPROVAL) {
+                ml->state = ML_STATE_REGISTERING;
+            }
             if (do_noise_handshake(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "Noise handshake failed");
                 ml_close_sock(ml->coord_sock);
@@ -2283,17 +2429,68 @@ void ml_coord_task(void *arg) {
             state = COORD_REGISTER;
             break;
 
-        case COORD_REGISTER:
+        case COORD_REGISTER: {
             ESP_LOGI(TAG, "Registering...");
-            if (do_register(ml, &noise) < 0) {
+            int reg = do_register(ml, &noise);
+            if (reg == REG_AUTHORIZED) {
+                state = COORD_FETCH_PEERS;
+                break;
+            }
+            ml_close_sock(ml->coord_sock);
+            ml->coord_sock = -1;
+            memset(&noise, 0, sizeof(noise));
+            if (reg < 0) {
                 ESP_LOGE(TAG, "Registration failed");
-                ml_close_sock(ml->coord_sock);
-                ml->coord_sock = -1;
                 state = COORD_RECONNECTING;
                 break;
             }
-            state = COORD_FETCH_PEERS;
+            switch (reg) {
+            case REG_NEEDS_LOGIN:
+                /* Ask again at once, following the URL: the answer comes
+                 * when someone has signed in there */
+                coord_announce(ml, ML_STATE_NEEDS_LOGIN);
+                reconnect_attempts = 0;
+                state = COORD_TCP_CONNECT;
+                break;
+            case REG_LOGIN_WAITING:
+                state = COORD_TCP_CONNECT;
+                break;
+            case REG_NEEDS_APPROVAL: {
+                coord_announce(ml, ML_STATE_NEEDS_APPROVAL);
+                reconnect_attempts = 0;
+                ml_coord_cmd_t wake_cmd;
+                if (xQueueReceive(ml->coord_cmd_queue, &wake_cmd,
+                                  pdMS_TO_TICKS(ML_APPROVAL_RECHECK_MS)) == pdTRUE &&
+                    wake_cmd == ML_CMD_DISCONNECT) {
+                    state = COORD_IDLE;
+                    ml->state = ML_STATE_IDLE;
+                    break;
+                }
+                state = COORD_TCP_CONNECT;
+                break;
+            }
+            case REG_KEY_EXPIRED:
+                /* Until the WireGuard interface exists nothing holds the old
+                 * key, so a new one can sign in now. After, it is saved for
+                 * the next start. */
+                if (!(xEventGroupGetBits(ml->events) & ML_EVT_COORD_REGISTERED) &&
+                    ml_node_key_rotate(ml, true) == ESP_OK) {
+                    state = COORD_TCP_CONNECT;
+                    break;
+                }
+                ml_node_key_rotate(ml, false);
+                coord_set_error(ml, ML_ERROR_NODE_KEY_EXPIRED, "node key expired");
+                coord_announce(ml, ML_STATE_ERROR);
+                state = COORD_IDLE;
+                break;
+            case REG_REFUSED:
+            default:
+                coord_announce(ml, ML_STATE_ERROR);
+                state = COORD_IDLE;
+                break;
+            }
             break;
+        }
 
         case COORD_FETCH_PEERS:
             ESP_LOGI(TAG, "Fetching peers...");
@@ -2305,6 +2502,9 @@ void ml_coord_task(void *arg) {
                 break;
             }
 
+            /* A peer map means the node is accepted, whatever the
+             * RegisterResponse carried */
+            ml->registered = true;
             xEventGroupSetBits(ml->events, ML_EVT_COORD_REGISTERED);
 
             /* Signal DERP I/O task to connect (connection now owned by I/O task) */
@@ -2579,7 +2779,9 @@ void ml_coord_task(void *arg) {
                 ESP_LOGI(TAG, "Reconnecting in %lu ms (attempt %d)",
                          (unsigned long)backoff_ms, reconnect_attempts + 1);
 
-                ml->state = ML_STATE_RECONNECTING;
+                if (!coord_login_pending(ml) && ml->state != ML_STATE_NEEDS_APPROVAL) {
+                    ml->state = ML_STATE_RECONNECTING;
+                }
 
                 /* Wait on command queue with backoff timeout (interruptible!) */
                 ml_coord_cmd_t wake_cmd;

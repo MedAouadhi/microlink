@@ -34,6 +34,7 @@ static const char *TAG = "microlink";
 #define NVS_KEY_WG_PUB      "wg_public"
 #define NVS_KEY_DISCO_PRI   "disco_pri"
 #define NVS_KEY_DISCO_PUB   "disco_pub"
+#define NVS_KEY_WG_OLD_PUB  "wg_old_pub"
 
 /* X25519 from x25519.h */
 #include "x25519.h"
@@ -96,6 +97,13 @@ static esp_err_t load_or_generate_keys(microlink_t *ml) {
         nvs_get_blob(nvs, NVS_KEY_DISCO_PUB, ml->disco_public_key, &key_len);
     }
 
+    /* A node key the control plane declared expired, until its successor is
+     * authorised */
+    key_len = 32;
+    ml->has_old_node_key = !need_save &&
+        nvs_get_blob(nvs, NVS_KEY_WG_OLD_PUB, ml->old_node_key, &key_len) == ESP_OK &&
+        key_len == 32;
+
     if (need_save) {
         nvs_set_blob(nvs, NVS_KEY_MACHINE_PRI, ml->machine_private_key, 32);
         nvs_set_blob(nvs, NVS_KEY_MACHINE_PUB, ml->machine_public_key, 32);
@@ -111,6 +119,50 @@ static esp_err_t load_or_generate_keys(microlink_t *ml) {
 
     nvs_close(nvs);
     return ESP_OK;
+}
+
+esp_err_t ml_node_key_rotate(microlink_t *ml, bool apply_now) {
+    uint8_t new_private[32], new_public[32];
+    generate_keypair(new_private, new_public);
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        memset(new_private, 0, sizeof(new_private));
+        return err;
+    }
+    /* The key being replaced is the one the control plane knows this node
+     * by, unless a rotation is already waiting to be authorised. */
+    if (!ml->has_old_node_key) {
+        memcpy(ml->old_node_key, ml->wg_public_key, 32);
+    }
+    err = nvs_set_blob(nvs, NVS_KEY_WG_OLD_PUB, ml->old_node_key, 32);
+    if (err == ESP_OK) err = nvs_set_blob(nvs, NVS_KEY_WG_PRI, new_private, 32);
+    if (err == ESP_OK) err = nvs_set_blob(nvs, NVS_KEY_WG_PUB, new_public, 32);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+
+    if (err == ESP_OK) {
+        ml->has_old_node_key = true;
+        if (apply_now) {
+            memcpy(ml->wg_private_key, new_private, 32);
+            memcpy(ml->wg_public_key, new_public, 32);
+        }
+        ESP_LOGI(TAG, "New node key saved%s", apply_now ? "" : " for the next start");
+    }
+    memset(new_private, 0, sizeof(new_private));
+    return err;
+}
+
+void ml_node_key_forget_old(microlink_t *ml) {
+    if (!ml->has_old_node_key) return;
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_erase_key(nvs, NVS_KEY_WG_OLD_PUB);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    ml->has_old_node_key = false;
 }
 
 /* ============================================================================
@@ -178,6 +230,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->config.enable_derp = true;  /* Always need DERP for relay */
 
     ml->state = ML_STATE_IDLE;
+    portMUX_INITIALIZE(&ml->reg_lock);
     ml->coord_sock = -1;
     ml->disco_sock4 = -1;
     ml->disco_sock6 = -1;
@@ -513,6 +566,32 @@ void microlink_destroy(microlink_t *ml) {
 
 microlink_state_t microlink_get_state(const microlink_t *ml) {
     return ml ? ml->state : ML_STATE_IDLE;
+}
+
+size_t microlink_get_auth_url(const microlink_t *ml, char *buf, size_t len) {
+    if (!buf || len == 0) return 0;
+    buf[0] = '\0';
+    if (!ml) return 0;
+    microlink_t *m = (microlink_t *)ml;
+    taskENTER_CRITICAL(&m->reg_lock);
+    strlcpy(buf, m->auth_url, len);
+    taskEXIT_CRITICAL(&m->reg_lock);
+    return strlen(buf);
+}
+
+microlink_error_t microlink_get_error(const microlink_t *ml, char *buf, size_t len) {
+    if (buf && len) buf[0] = '\0';
+    if (!ml) return ML_ERROR_NONE;
+    microlink_t *m = (microlink_t *)ml;
+    taskENTER_CRITICAL(&m->reg_lock);
+    microlink_error_t code = m->last_error_code;
+    if (buf && len) strlcpy(buf, m->last_error, len);
+    taskEXIT_CRITICAL(&m->reg_lock);
+    return code;
+}
+
+bool microlink_is_registered(const microlink_t *ml) {
+    return ml && ml->registered;
 }
 
 bool microlink_is_connected(const microlink_t *ml) {

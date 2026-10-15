@@ -64,8 +64,24 @@ typedef enum {
     ML_STATE_REGISTERING,
     ML_STATE_CONNECTED,
     ML_STATE_RECONNECTING,
-    ML_STATE_ERROR,
+    ML_STATE_ERROR,             /* refused: see microlink_get_error() */
+    /* Appended, so the values above keep theirs. */
+    ML_STATE_NEEDS_LOGIN,       /* the control plane wants this node signed in:
+                                   open microlink_get_auth_url() to do it */
+    ML_STATE_NEEDS_APPROVAL,    /* signed in, waiting for an admin of the
+                                   tailnet to approve the node */
 } microlink_state_t;
+
+/* Why the client stopped trying (ML_STATE_ERROR) */
+typedef enum {
+    ML_ERROR_NONE = 0,
+    ML_ERROR_REFUSED,           /* the control plane refused the registration,
+                                   for instance an auth key that is invalid,
+                                   expired or already used */
+    ML_ERROR_NODE_KEY_EXPIRED,  /* the node key expired while in use; a new
+                                   one is saved, and the next start signs in
+                                   with it */
+} microlink_error_t;
 
 /* Callback types */
 typedef void (*microlink_state_cb_t)(microlink_t *ml, microlink_state_t state, void *user_data);
@@ -123,6 +139,33 @@ void microlink_destroy(microlink_t *ml);
  * @brief Get current connection state
  */
 microlink_state_t microlink_get_state(const microlink_t *ml);
+
+/**
+ * @brief The URL that signs this node in, while the state is ML_STATE_NEEDS_LOGIN
+ * @param buf Output, NUL-terminated ("" when no login is pending)
+ * @return Length of the URL, 0 when none is pending
+ *
+ * Without an auth key the control plane answers a registration with a URL
+ * (https://login.tailscale.com/a/...). Opening it in a browser and signing
+ * in authorises this node; the client waits on it and carries on by itself.
+ * The URL can change while waiting, so ask again when the state changes.
+ */
+size_t microlink_get_auth_url(const microlink_t *ml, char *buf, size_t len);
+
+/**
+ * @brief Why the client stopped trying, once the state is ML_STATE_ERROR
+ * @param buf Output: the control plane's own words, or "" (may be NULL)
+ */
+microlink_error_t microlink_get_error(const microlink_t *ml, char *buf, size_t len);
+
+/**
+ * @brief Whether the control plane has authorised this node since start
+ *
+ * True from the registration the control plane accepts, before the peers
+ * have arrived and before the state is ML_STATE_CONNECTED. An auth key is
+ * spent at that point, and the client forgets its pointer to it.
+ */
+bool microlink_is_registered(const microlink_t *ml);
 
 /**
  * @brief Check if connected and ready to send/receive

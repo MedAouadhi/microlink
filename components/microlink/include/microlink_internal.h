@@ -191,6 +191,13 @@ typedef struct {
  * coord task inside a DNS lookup, which cannot be interrupted. */
 #define ML_STOP_TIMEOUT_MS          30000
 
+/* How long one registration that follows a login URL waits for the user to
+ * sign in, before the client asks again on a fresh connection. */
+#define ML_LOGIN_WAIT_MS            (5 * 60 * 1000)
+
+/* How often a node waiting for an admin's approval asks again. */
+#define ML_APPROVAL_RECHECK_MS      30000
+
 /* ============================================================================
  * Queue Message Types
  * ========================================================================== */
@@ -361,6 +368,19 @@ struct microlink_s {
     /* A stop that timed out leaves tasks that may still use this context, so
      * microlink_destroy() leaks it rather than freeing it under them. */
     bool stop_incomplete;
+
+    /* What the control plane said to the last registration. The coord task
+     * writes these; callers read them under reg_lock. */
+    portMUX_TYPE reg_lock;
+    char auth_url[192];             /* "" unless a login is pending */
+    char last_error[128];
+    microlink_error_t last_error_code;
+    volatile bool registered;       /* authorised since start */
+
+    /* The node key before the control plane declared it expired, sent as
+     * OldNodeKey until its successor is authorised (NVS "wg_old_pub"). */
+    uint8_t old_node_key[32];
+    bool has_old_node_key;
 
     /* Queues */
     QueueHandle_t derp_tx_queue;        /* -> derp_tx task */
@@ -543,6 +563,15 @@ esp_err_t ml_zerocopy_send(microlink_t *ml, const uint8_t *data, size_t len,
 
 /* Utility */
 uint64_t ml_get_time_ms(void);
+
+/* Replace the node (WireGuard) key with a new one and save it, keeping the
+ * old public key as OldNodeKey. With apply_now false only NVS changes, for a
+ * run whose WireGuard interface already holds the old key: the next
+ * microlink_init() loads the new one. */
+esp_err_t ml_node_key_rotate(microlink_t *ml, bool apply_now);
+
+/* Drop the OldNodeKey once its successor has been authorised. */
+void ml_node_key_forget_old(microlink_t *ml);
 
 /* ============================================================================
  * Network Socket Wrappers — Route through AT sockets when cellular active
