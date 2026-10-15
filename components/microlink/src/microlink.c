@@ -567,6 +567,21 @@ void microlink_destroy(microlink_t *ml) {
         ml->config_httpd = NULL;
     }
 
+    /* Packets the tasks had not taken yet carry heap buffers of their own,
+     * which deleting the queues would leak: a small one lands in internal
+     * RAM, so every stop lost a little of it. */
+    ml_rx_packet_t pkt;
+    QueueHandle_t rx_queues[] = { ml->disco_rx_queue, ml->wg_rx_queue, ml->stun_rx_queue };
+    for (size_t q = 0; q < sizeof(rx_queues) / sizeof(rx_queues[0]); q++) {
+        while (rx_queues[q] && xQueueReceive(rx_queues[q], &pkt, 0) == pdTRUE) {
+            free(pkt.data);
+        }
+    }
+    ml_peer_update_t *update;
+    while (ml->peer_update_queue && xQueueReceive(ml->peer_update_queue, &update, 0) == pdTRUE) {
+        free(update);
+    }
+
     /* Delete queues */
     if (ml->derp_tx_queue) vQueueDelete(ml->derp_tx_queue);
     if (ml->disco_rx_queue) vQueueDelete(ml->disco_rx_queue);

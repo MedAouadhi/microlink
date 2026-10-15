@@ -2317,6 +2317,15 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
 #define DERP_PROBE_TIMEOUT_MS  1500  /* per batch */
 #define DERP_PROBE_MARGIN_MS   15    /* not worth moving home for less */
 
+/* Close a probe with a reset rather than a FIN: closed politely, each one
+ * leaves its PCB in TIME_WAIT for two minutes, about 30 of them a run.
+ * Needs CONFIG_LWIP_SO_LINGER; without it the close stays polite. */
+static void probe_close(int fd) {
+    struct linger abort_close = { .l_onoff = 1, .l_linger = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_LINGER, &abort_close, sizeof(abort_close));
+    close(fd);
+}
+
 static uint16_t measure_derp_regions(microlink_t *ml, uint32_t *best_ms_out) {
 #ifdef CONFIG_ML_ENABLE_CELLULAR
     if (ml_at_socket_is_ready()) return 0;  /* AT sockets have no select() */
@@ -2388,13 +2397,13 @@ static uint16_t measure_derp_regions(microlink_t *ml, uint32_t *best_ms_out) {
                     }
                     if (ids[i] == ml->preferred_derp) home_ms = ms;
                 }
-                close(fds[i]);
+                probe_close(fds[i]);
                 fds[i] = -1;
                 open--;
             }
         }
         for (int i = 0; i < n; i++) {
-            if (fds[i] >= 0) close(fds[i]);
+            if (fds[i] >= 0) probe_close(fds[i]);
         }
         if (xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST) return 0;
     }

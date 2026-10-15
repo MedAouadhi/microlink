@@ -24,6 +24,7 @@
 #include "lwip/ip_addr.h"
 #include "lwip/ip.h"
 #include "lwip/tcpip.h"
+#include "lwip/priv/tcpip_priv.h"
 #include "nacl_box.h"
 #include "wireguardif.h"
 #include "wireguard.h"
@@ -1484,6 +1485,21 @@ static void disco_periodic_probes(microlink_t *ml) {
  * WG Manager Task
  * ========================================================================== */
 
+/* Taking the WireGuard netif out of lwIP, on its TCPIP thread */
+struct wg_teardown {
+    struct tcpip_api_call_data call;  /* first: tcpip_api_call() hands it back */
+    struct netif *netif;
+};
+
+static err_t wg_teardown_on_tcpip(struct tcpip_api_call_data *call) {
+    struct netif *netif = ((struct wg_teardown *)call)->netif;
+    wireguardif_shutdown(netif);
+    netif_set_link_down(netif);
+    netif_set_down(netif);
+    netif_remove(netif);
+    return ERR_OK;
+}
+
 void ml_wg_mgr_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     ESP_LOGI(TAG, "WG Manager task started (Core %d)", xPortGetCoreID());
@@ -1627,14 +1643,19 @@ void ml_wg_mgr_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    /* Shutdown WireGuard interface */
+    /* Shutdown WireGuard interface, on the TCPIP thread: lwIP's netif list
+     * and timers are its alone without core locking, and a packet it is
+     * routing may be on its way to this netif. Once it has gone, nothing
+     * refers to the device wireguardif_init() allocated, which nothing in
+     * wireguard-lwip frees. */
     if (ml->wg_netif) {
         struct netif *netif = (struct netif *)ml->wg_netif;
-        wireguardif_shutdown(netif);
-        netif_set_link_down(netif);
-        netif_set_down(netif);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        netif_remove(netif);
+        struct wg_teardown teardown = { .netif = netif };
+        tcpip_api_call(wg_teardown_on_tcpip, &teardown.call);
+        if (netif->state) {
+            mem_free(netif->state);
+            netif->state = NULL;
+        }
         free(netif);
         ml->wg_netif = NULL;
     }
