@@ -523,18 +523,14 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
         IP4_ADDR(&wg_peer.allowed_ip.u_addr.ip4, ip_a, ip_b, ip_c, ip_d);
         IP4_ADDR(&wg_peer.allowed_mask.u_addr.ip4, 255, 255, 255, 255);
 
-        /* Set endpoint if available, otherwise leave blank for DERP-only */
-        if (p->endpoint_count > 0 && p->endpoints[0].ip != 0) {
-            uint8_t ea = (p->endpoints[0].ip >> 24) & 0xFF;
-            uint8_t eb = (p->endpoints[0].ip >> 16) & 0xFF;
-            uint8_t ec = (p->endpoints[0].ip >> 8) & 0xFF;
-            uint8_t ed = p->endpoints[0].ip & 0xFF;
-            IP4_ADDR(&wg_peer.endpoint_ip.u_addr.ip4, ea, eb, ec, ed);
-            wg_peer.endport_port = p->endpoints[0].port;
-        } else {
-            ip_addr_set_any(false, &wg_peer.endpoint_ip);
-            wg_peer.endport_port = 0;
-        }
+        /* No endpoint until one is known to work, so everything goes through
+         * DERP until DISCO finds a direct path (wireguardif_connect) or a
+         * packet from the peer arrives directly (update_peer_addr). With the
+         * peer's first advertised endpoint here, a session the peer started
+         * through DERP sent its data there: from behind a mobile network's
+         * NAT, or to an address that does not hairpin, it arrived nowhere. */
+        ip_addr_set_any(false, &wg_peer.endpoint_ip);
+        wg_peer.endport_port = 0;
 
         wg_peer.keep_alive = 25;
 
@@ -1643,9 +1639,8 @@ void ml_wg_mgr_task(void *arg) {
         /* A packet to a peer found no WireGuard session: start one the way
          * microlink_tcp_connect() does, through DERP and the direct path
          * DISCO found, so a plain socket reaches a peer that has not reached
-         * us first. wireguard-lwip alone would send it to the peer's first
-         * endpoint, often an address behind a NAT that does not hairpin. At
-         * most every REKEY_TIMEOUT, as WireGuard spaces initiations. */
+         * us first. At most every REKEY_TIMEOUT, as WireGuard spaces
+         * initiations. */
         if (ml->wg_netif) {
             uint64_t ask_now = ml_get_time_ms();
             for (int i = 0; i < ml->peer_count; i++) {

@@ -1131,6 +1131,15 @@ static bool should_destroy_current_keypair(struct wireguard_peer *peer) {
 	return result;
 }
 
+// Only a new handshake replaced the previous keypair, and while it was valid
+// the peer counted as up (wireguardif_peer_is_up), so a session that had
+// ended was not started again when a packet asked for one. Past
+// REJECT_AFTER_TIME no packet may use it.
+static bool should_destroy_previous_keypair(struct wireguard_peer *peer) {
+	return peer->prev_keypair.valid &&
+			wireguard_expired(peer->prev_keypair.keypair_millis, REJECT_AFTER_TIME);
+}
+
 static bool should_reset_peer(struct wireguard_peer *peer) {
 	bool result = false;
 	if (peer->curr_keypair.valid && (wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME * 3))) {
@@ -1151,7 +1160,6 @@ static void wireguardif_tmr(void *arg) {
 	sys_timeout(WIREGUARDIF_TIMER_MSECS, wireguardif_tmr, device);
 
 	// Check periodic things
-	bool link_up = false;
 	for (x=0; x < WIREGUARD_MAX_PEERS; x++) {
 		peer = &device->peers[x];
 		if (peer->valid) {
@@ -1171,23 +1179,18 @@ static void wireguardif_tmr(void *arg) {
 				// Destroy current keypair
 				keypair_destroy(&peer->curr_keypair);
 			}
+			if (should_destroy_previous_keypair(peer)) {
+				keypair_destroy(&peer->prev_keypair);
+			}
 			if (should_send_keepalive(peer)) {
 				wireguardif_send_keepalive(device, peer);
 			}
 			if (should_send_initiation(peer)) {
 				wireguard_start_handshake(device->netif, peer);
 			}
-
-			if ((peer->curr_keypair.valid) || (peer->prev_keypair.valid)) {
-				link_up = true;
-			}
 		}
 	}
-
-	if (!link_up) {
-		// Clear the IF-UP flag on netif
-		netif_set_link_down(device->netif);
-	}
+	// The link stays up with no session, as in wireguardif_periodic()
 }
 
 void wireguardif_periodic(struct netif *netif) {
@@ -1200,7 +1203,13 @@ void wireguardif_periodic(struct netif *netif) {
 
 	// Perform the same work as wireguardif_tmr but from the caller's task context,
 	// avoiding heavy crypto (X25519, ChaCha20-Poly1305) on the lwIP TCPIP thread.
-	bool link_up = false;
+	//
+	// The link stays up while no peer has a session. Taken down, lwIP routed
+	// packets for the tailnet out of the default netif instead: they never
+	// reached wireguardif_output() to ask for a session (wants_session), so
+	// none was started unless a peer started one, which on a LAN DISCO's
+	// first direct path does and behind a mobile network's NAT nothing does.
+	// And they left unencrypted, by WiFi or the modem.
 	for (x = 0; x < WIREGUARD_MAX_PEERS; x++) {
 		peer = &device->peers[x];
 		if (peer->valid) {
@@ -1213,6 +1222,9 @@ void wireguardif_periodic(struct netif *netif) {
 			}
 			if (should_destroy_current_keypair(peer)) {
 				keypair_destroy(&peer->curr_keypair);
+			}
+			if (should_destroy_previous_keypair(peer)) {
+				keypair_destroy(&peer->prev_keypair);
 			}
 			if (should_send_keepalive(peer)) {
 				wireguardif_send_keepalive(device, peer);
@@ -1230,13 +1242,7 @@ void wireguardif_periodic(struct netif *netif) {
 				       peer->active, peer->send_handshake);
 				wireguard_start_handshake(device->netif, peer);
 			}
-			if ((peer->curr_keypair.valid) || (peer->prev_keypair.valid)) {
-				link_up = true;
-			}
 		}
-	}
-	if (!link_up) {
-		netif_set_link_down(device->netif);
 	}
 }
 
