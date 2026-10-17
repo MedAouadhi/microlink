@@ -124,7 +124,7 @@ err_t wireguardif_remove_peer(struct netif *netif, u8_t peer_index);
 // Update the "connect" IP of the given peer
 err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port);
 
-// Try and connect to the given peer
+// Start a handshake with the given peer at its connect IP, once
 err_t wireguardif_connect(struct netif *netif, u8_t peer_index);
 
 // Stop trying to connect to the given peer
@@ -143,6 +143,12 @@ void wireguardif_set_derp_output(struct netif *netif, wireguard_derp_output_fn f
 // Use this for peers where connect() would fail due to no direct endpoint
 // The handshake will be routed through the DERP callback if set
 err_t wireguardif_connect_derp(struct netif *netif, u8_t peer_index);
+
+// One handshake whose initiation goes through DERP and to ip:port as well,
+// for a peer with a direct path: two, one each way, raced, and the peer
+// answered the one replaced. Data goes through DERP until a packet comes
+// back directly. Without both output callbacks, wireguardif_connect_derp().
+err_t wireguardif_connect_derp_and_direct(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port);
 
 // Whether a packet for the peer was dropped for want of a session since the
 // last call; clears it. The caller starts one the way it reaches the peer.

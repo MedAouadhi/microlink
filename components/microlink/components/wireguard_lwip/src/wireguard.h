@@ -177,6 +177,8 @@ struct wireguard_peer {
 	// last_tx and last_rx of data packets
 	uint32_t last_tx;
 	uint32_t last_rx;
+	// The last packet received with something in it, not a keepalive
+	uint32_t last_data_rx;
 
 	// We set this flag on RX/TX of packets if we think that we should initiate a new handshake
 	bool send_handshake;

@@ -532,7 +532,13 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
         ip_addr_set_any(false, &wg_peer.endpoint_ip);
         wg_peer.endport_port = 0;
 
-        wg_peer.keep_alive = 25;
+        /* No persistent keepalive: a session lapses once idle, as
+         * Tailscale's do, and the next packet starts another
+         * (wants_session). A keepalive every 25 s, and the renewals it
+         * brought, kept every session a peer had ever had for as long as
+         * the tailnet was up, waking a modem each time. wireguard-lwip
+         * still answers data with WireGuard's passive keepalive. */
+        wg_peer.keep_alive = 0;
 
         u8_t wg_peer_idx = WIREGUARDIF_INVALID_INDEX;
         err_t wg_err = wireguardif_add_peer(netif, &wg_peer, &wg_peer_idx);
@@ -985,30 +991,16 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                              (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
                              (int)pkt->src_port, p->hostname);
                     /* First direct path discovery — send a one-shot handshake
-                     * via direct UDP. Do NOT use wireguardif_connect() which
-                     * sets peer->active=true and causes infinite handshake
-                     * retries (every 5s) when the peer has us trimmed.
-                     * Instead, just fire a single handshake init. If the peer
-                     * has us configured, it will respond and establish session.
-                     * If not, we stop and wait for them to initiate. */
+                     * via direct UDP (wireguardif_connect() fires one and
+                     * does not retry). If the peer has us configured, it
+                     * will respond and establish session. If not, we stop
+                     * and wait for them to initiate. */
                     if (!p->tried_initial_handshake) {
                         p->tried_initial_handshake = true;
                         /* Store endpoint so wireguardif_connect sends to it */
                         wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
                                                      &ep_ip, pkt->src_port);
-                        /* Fire one handshake init but don't leave peer active.
-                         * wireguardif_connect sets active=true internally, so
-                         * we immediately clear it after to prevent retries. */
                         wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-                        /* Clear active to prevent infinite retry loop.
-                         * If handshake succeeds, the response handler will
-                         * establish the session regardless of active flag. */
-                        {
-                            struct wireguard_device *dev = (struct wireguard_device *)netif->state;
-                            if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
-                                dev->peers[p->wg_peer_index].active = false;
-                            }
-                        }
                         ESP_LOGI(TAG, "WG one-shot handshake to %s (first direct path)", p->hostname);
                     }
                 }
@@ -1353,26 +1345,25 @@ esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
     err_t is_up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index, NULL, NULL);
     if (is_up == ERR_OK) return ESP_OK;
 
-    /* Path 1: DERP (reliable fallback) */
-    wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
-    ESP_LOGI(TAG, "WG handshake triggered (DERP) to %s", p->hostname);
-
-    /* Path 2: Direct UDP (if DISCO has a known endpoint).
-     * This wakes the peer's magicsock via receiveIPv4 → noteRecvActivity.
-     * Set connect_ip first, then call wireguardif_connect which copies
-     * connect_ip → ip and starts a second handshake to the direct endpoint. */
+    /* Through DERP, and if DISCO has a known endpoint, the same initiation
+     * to it as well, which also wakes the peer's magicsock (receiveIPv4 →
+     * noteRecvActivity). One handshake for both: a second, for the direct
+     * path, replaced the first, and a peer that answered the first was not
+     * heard until the retry 5 s later. */
     if (p->best_ip != 0 && p->best_port != 0) {
         ip_addr_t ep_ip;
         IP_SET_TYPE_VAL(ep_ip, IPADDR_TYPE_V4);
         ip4_addr_set_u32(ip_2_ip4(&ep_ip), htonl(p->best_ip));
-        wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
-                                     &ep_ip, p->best_port);
-        wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-        ESP_LOGI(TAG, "WG handshake triggered (direct) to %s at %d.%d.%d.%d:%d",
+        wireguardif_connect_derp_and_direct(netif, (u8_t)p->wg_peer_index,
+                                            &ep_ip, p->best_port);
+        ESP_LOGI(TAG, "WG handshake triggered (DERP and direct) to %s at %d.%d.%d.%d:%d",
                  p->hostname,
                  (int)((p->best_ip >> 24) & 0xFF), (int)((p->best_ip >> 16) & 0xFF),
                  (int)((p->best_ip >> 8) & 0xFF), (int)(p->best_ip & 0xFF),
                  (int)p->best_port);
+    } else {
+        wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
+        ESP_LOGI(TAG, "WG handshake triggered (DERP) to %s", p->hostname);
     }
 
     return ESP_OK;

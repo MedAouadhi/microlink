@@ -504,6 +504,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 					netif_set_link_up(device->netif);
 
 					if (pbuf->tot_len > 0) {
+						peer->last_data_rx = now;
 						//4a. Once the packet payload is decrypted, the interface has a plaintext packet. If this is not an IP packet, it is dropped.
 						iphdr = (struct ip_hdr *)pbuf->payload;
 						// Check for packet replay / dupes
@@ -891,7 +892,13 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 	pbuf_free(p);
 }
 
-static err_t wireguard_start_handshake(struct netif *netif, struct wireguard_peer *peer) {
+// Sends a handshake initiation the peer's way (wireguardif_peer_output) and,
+// given also_ip, the same message there too: one initiation by two paths,
+// for the peer to answer whichever reaches it first. The second copy goes
+// only through the output callbacks, which copy the pbuf; udp_sendto() would
+// have written headers into it.
+static err_t wireguard_start_handshake_also(struct netif *netif, struct wireguard_peer *peer,
+		const ip_addr_t *also_ip, u16_t also_port) {
 	if (!netif || !netif->state) {
 		return ERR_ARG;
 	}
@@ -909,6 +916,13 @@ static err_t wireguard_start_handshake(struct netif *netif, struct wireguard_pee
 		printf("[WG_TX] Handshake init sent, result=%d, sender_idx=%lu, to %s:%u\n",
 			result, (unsigned long)msg.sender,
 			ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip), peer->port);
+		if (also_ip && device->udp_output_fn && device->derp_output_fn) {
+			err_t also = wireguardif_device_output(device, pbuf, also_ip, also_port);
+			printf("[WG_TX] Same init sent, result=%d, to %s:%u\n", also, ipaddr_ntoa(also_ip), also_port);
+			if (result != ERR_OK) {
+				result = also;
+			}
+		}
 		pbuf_free(pbuf);
 		peer->send_handshake = false;
 		peer->last_initiation_tx = wireguard_sys_now();
@@ -918,6 +932,10 @@ static err_t wireguard_start_handshake(struct netif *netif, struct wireguard_pee
 		printf("[WG_TX] FAILED to create handshake initiation, result=%d\n", result);
 	}
 	return result;
+}
+
+static err_t wireguard_start_handshake(struct netif *netif, struct wireguard_peer *peer) {
+	return wireguard_start_handshake_also(netif, peer, NULL, 0);
 }
 
 static err_t wireguardif_lookup_peer(struct netif *netif, u8_t peer_index, struct wireguard_peer **out) {
@@ -947,8 +965,9 @@ err_t wireguardif_connect(struct netif *netif, u8_t peer_index) {
 	if (result == ERR_OK) {
 		// Check that a valid connect ip and port have been set
 		if (!ip_addr_isany(&peer->connect_ip) && (peer->connect_port > 0)) {
-			// Set the flag that we want to try connecting
-			peer->active = true;
+			// One handshake, not `active`, which would start a session again
+			// whenever one ended, for ever: whoever still has packets for the
+			// peer asks again (wants_session), so an idle peer is left alone
 			peer->ip = peer->connect_ip;
 			peer->port = peer->connect_port;
 			// Force immediate handshake to the new endpoint
@@ -1099,7 +1118,9 @@ static bool should_send_initiation(struct wireguard_peer *peer) {
 	if (wireguardif_can_send_initiation(peer)) {
 		if (peer->send_handshake) {
 			result = true;
-		} else if (peer->curr_keypair.valid && !peer->curr_keypair.initiator && wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME - peer->keepalive_interval)) {
+		} else if (peer->keepalive_interval > 0 && peer->curr_keypair.valid && !peer->curr_keypair.initiator && wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME - peer->keepalive_interval)) {
+			// Renewing a session by the clock keeps it for ever, used or
+			// not: only for a peer kept alive (keepalive_interval)
 			result = true;
 		} else if (!peer->curr_keypair.valid && peer->active) {
 			result = true;
@@ -1115,6 +1136,14 @@ static bool should_send_keepalive(struct wireguard_peer *peer) {
 			if (wireguard_expired(peer->last_tx, peer->keepalive_interval)) {
 				result = true;
 			}
+		}
+	} else if ((peer->curr_keypair.valid) || (peer->prev_keypair.valid)) {
+		// WireGuard's passive keepalive: data came in and nothing has gone
+		// back for KEEPALIVE_TIMEOUT, so the peer hears the session is
+		// alive. Unlike the persistent one, an idle session stays quiet.
+		if (peer->last_data_rx != 0 && (int32_t)(peer->last_data_rx - peer->last_tx) > 0 &&
+				wireguard_expired(peer->last_data_rx, KEEPALIVE_TIMEOUT)) {
+			result = true;
 		}
 	}
 	return result;
@@ -1427,8 +1456,7 @@ err_t wireguardif_connect_derp(struct netif *netif, u8_t peer_index) {
 	struct wireguard_peer *peer;
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
 	if (result == ERR_OK) {
-		// Mark peer as active so timer will initiate handshakes
-		peer->active = true;
+		// One handshake, not `active`: as in wireguardif_connect()
 		// Force immediate handshake by setting send_handshake flag
 		peer->send_handshake = true;
 		// CRITICAL: Clear endpoint IP/port to force DERP relay output!
@@ -1441,6 +1469,26 @@ err_t wireguardif_connect_derp(struct netif *netif, u8_t peer_index) {
 		// Now start handshake immediately
 		wireguard_start_handshake(netif, peer);
 		result = ERR_OK;
+	}
+	return result;
+}
+
+err_t wireguardif_connect_derp_and_direct(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port) {
+	struct wireguard_peer *peer;
+	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
+	if (result == ERR_OK) {
+		struct wireguard_device *device = (struct wireguard_device *)netif->state;
+		if (device->force_derp_output || !device->udp_output_fn || !device->derp_output_fn) {
+			return wireguardif_connect_derp(netif, peer_index);
+		}
+		peer->connect_ip = *ip;
+		peer->connect_port = port;
+		// Data goes through DERP until the response, or a packet, comes
+		// straight back (update_peer_addr)
+		ip_addr_set_any(false, &peer->ip);
+		peer->port = 0;
+		peer->last_initiation_tx = 0;
+		result = wireguard_start_handshake_also(netif, peer, ip, port);
 	}
 	return result;
 }
