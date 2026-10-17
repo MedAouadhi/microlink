@@ -75,6 +75,10 @@ extern "C" {
 #define ML_DERP_REGION          9       /* Dallas (dfw) */
 #define ML_DERP_HOST            "derp9e.tailscale.com"
 #define ML_DERP_PORT            443
+/* The server sends a KeepAlive every 60 to 65 s; with nothing at all for
+ * two of them the connection is gone (derp.KeepAlive, and the 120 s read
+ * deadline of Tailscale's own DERP client) */
+#define ML_DERP_RECV_TIMEOUT_MS 120000
 
 /* Tailscale control plane */
 #define ML_CTRL_HOST            "controlplane.tailscale.com"
@@ -87,6 +91,9 @@ extern "C" {
 #define ML_DISCO_TRUST_DURATION_MS      15000
 #define ML_DISCO_PING_TIMEOUT_MS        5000
 #define ML_DISCO_UPGRADE_INTERVAL_MS    15000
+/* A session is in use while WireGuard carried a packet to or from the peer
+ * this recently: tailscaled's sessionActiveTimeout. Only then are direct
+ * paths probed and kept, and STUN run at its active pace. */
 #define ML_DISCO_SESSION_ACTIVE_MS      45000
 
 /* STUN servers (Tailscale primary, Google fallback) */
@@ -100,9 +107,12 @@ extern "C" {
 /* STUN timing */
 #define ML_STUN_RETRANSMIT_MS           100
 #define ML_STUN_TOTAL_TIMEOUT_MS        5000
-#define ML_STUN_RESTUN_INTERVAL_MS      23000
+#define ML_STUN_RESTUN_INTERVAL_MS      23000   /* while a session is in use */
+#define ML_STUN_IDLE_INTERVAL_MS        300000  /* otherwise */
 
-/* Control plane timing */
+/* Control plane timing. The watchdog is fed by what the server sends, its
+ * keep-alives about once a minute among it; the client sends nothing to
+ * keep the connection, as tailscaled does not. */
 #define ML_CTRL_WATCHDOG_MS             120000
 #define ML_CTRL_BACKOFF_MAX_MS          30000
 #define ML_CTRL_KEEPALIVE_MS            60000
@@ -350,6 +360,19 @@ typedef struct {
     uint64_t last_recv_ms;          /* For keepalive watchdog */
 } ml_derp_conn_t;
 
+/* The endpoints and NetInfo an endpoint update carried */
+typedef struct {
+    bool valid;                     /* false: nothing told yet */
+    uint32_t lan_ip;
+    uint32_t ip;
+    uint16_t port;
+    uint8_t ip6[16];
+    uint16_t port6;
+    uint16_t preferred_derp;
+    bool nat_checked;
+    bool mapping_varies;
+} ml_endpoints_told_t;
+
 /* ============================================================================
  * Main Context
  * ========================================================================== */
@@ -449,6 +472,14 @@ struct microlink_s {
     uint16_t stun_secondary_port;   /* Mapped port from second STUN server */
     bool stun_nat_checked;          /* true if symmetric NAT check completed */
     bool nat_mapping_varies;        /* true = symmetric NAT (direct won't work) */
+
+    /* What the last endpoint update told the control plane, on this
+     * connection to it (coord task only) */
+    ml_endpoints_told_t endpoints_told;
+
+    /* A peer's session is in use (ML_DISCO_SESSION_ACTIVE_MS); written by
+     * the wg_mgr task each second, read by coord to pace STUN */
+    volatile bool session_in_use;
 
     /* DERP map (parsed from MapResponse, owned by coord task) */
     ml_derp_region_t derp_regions[ML_MAX_DERP_REGIONS];

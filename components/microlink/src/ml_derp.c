@@ -638,6 +638,18 @@ void ml_derp_tx_task(void *arg) {
             }
         }
 
+        /* Nothing sent keeps the connection: the server's KeepAlives do,
+         * and without any for two of them it has gone, though a write may
+         * still be taken. The NotePreferred once a minute that used to be
+         * sent would have found that out only as TCP gave up on it. */
+        if (ml->derp.connected &&
+            ml_get_time_ms() - ml->derp.last_recv_ms > ML_DERP_RECV_TIMEOUT_MS) {
+            ESP_LOGW(TAG, "Nothing from DERP for %lu s; reconnecting",
+                     (unsigned long)((ml_get_time_ms() - ml->derp.last_recv_ms) / 1000));
+            ml->derp.connected = false;
+            xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+        }
+
         /* Yield briefly */
         vTaskDelay(pdMS_TO_TICKS(1));
     }

@@ -43,7 +43,7 @@ typedef struct {
 
     /* Optional timing overrides (0 = use defaults) */
     uint32_t disco_heartbeat_ms;    /* DISCO keepalive interval (default: 3000) */
-    uint32_t stun_interval_ms;      /* STUN re-probe interval (default: 23000) */
+    uint32_t stun_interval_ms;      /* STUN re-probe interval while a session is in use (default: 23000) */
     uint32_t ctrl_watchdog_ms;      /* Control plane watchdog timeout (default: 120000) */
 
     /* The DERP region to use as home, which peers relay through to reach

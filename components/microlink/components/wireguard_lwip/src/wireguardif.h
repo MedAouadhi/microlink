@@ -154,6 +154,15 @@ err_t wireguardif_connect_derp_and_direct(struct netif *netif, u8_t peer_index, 
 // last call; clears it. The caller starts one the way it reaches the peer.
 bool wireguardif_take_wants_session(struct netif *netif, u8_t peer_index);
 
+// Milliseconds since the peer's session last carried a packet either way,
+// data or keepalive; UINT32_MAX if it never has. Handshakes do not count.
+uint32_t wireguardif_peer_idle_ms(struct netif *netif, u8_t peer_index);
+
+// Send the peer's packets through DERP from now on, starting no handshake:
+// for a direct path no longer known to work, on a session that may not be
+// used again. A packet straight from the peer, or a connect, sets one again.
+err_t wireguardif_use_derp(struct netif *netif, u8_t peer_index);
+
 // Inject a received packet into the WireGuard interface (for magicsock demux)
 // This allows an external unified socket to receive all packets and route
 // WireGuard packets to this interface. The packet data is copied internally.

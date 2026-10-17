@@ -1430,6 +1430,16 @@ check_removed:
     }
 }
 
+/* The WiFi station's address, host byte order; 0 without one */
+static uint32_t wifi_lan_ip(void) {
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip_info;
+    if (sta_netif && esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) {
+        return ntohl(ip_info.ip.addr);
+    }
+    return 0;
+}
+
 /* Add Endpoints + EndpointTypes arrays to a MapRequest JSON object.
  * Includes: WiFi LAN endpoint (type=Local), STUN IPv4 (type=STUN),
  * STUN IPv6 (type=STUN). Returns number of endpoints added. */
@@ -1440,11 +1450,9 @@ static int add_endpoints_to_json(microlink_t *ml, cJSON *root) {
     if (!ep_array || !et_array) return 0;
 
     /* LAN endpoint (WiFi STA) */
-    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (sta_netif) {
-        esp_netif_ip_info_t ip_info;
-        if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
-            uint32_t local_ip = ntohl(ip_info.ip.addr);
+    {
+        uint32_t local_ip = wifi_lan_ip();
+        if (local_ip != 0) {
             char ep_str[32];
             snprintf(ep_str, sizeof(ep_str), "%lu.%lu.%lu.%lu:%u",
                      (unsigned long)((local_ip >> 24) & 0xFF),
@@ -2081,6 +2089,27 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
     return 0;
 }
 
+/* Whether an endpoint update would tell the control plane anything it has
+ * not been told on this connection, as tailscaled reports its endpoints and
+ * NetInfo only when they change. A STUN port that moved alone counts only
+ * while a session is in use and the NAT maps one port for every
+ * destination. Idle, nothing keeps the NAT's mapping, so a mobile network
+ * hands each probe a new port that lapses before a peer could use it; and a
+ * NAT that maps by destination gives a peer a port of its own anyway. */
+static bool endpoints_are_news(microlink_t *ml) {
+    const ml_endpoints_told_t *told = &ml->endpoints_told;
+    if (!told->valid) return true;
+    bool ports_count = ml->session_in_use && !ml->nat_mapping_varies;
+    return told->lan_ip != wifi_lan_ip() ||
+           told->ip != ml->stun_public_ip ||
+           (ports_count && told->port != ml->stun_public_port) ||
+           memcmp(told->ip6, ml->stun_public_ip6, 16) != 0 ||
+           (ports_count && told->port6 != ml->stun_public_port6) ||
+           told->preferred_derp != ml->preferred_derp ||
+           told->nat_checked != ml->stun_nat_checked ||
+           told->mapping_varies != ml->nat_mapping_varies;
+}
+
 /* Send a "lite" endpoint update to the control plane.
  * This is a non-streaming MapRequest (Stream=false, OmitPeers=true) that
  * only updates our endpoints and hostinfo. Required because Version >= 68
@@ -2179,6 +2208,18 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
         return -1;
     }
     free(h2_buf);
+
+    ml->endpoints_told = (ml_endpoints_told_t){
+        .valid = true,
+        .lan_ip = wifi_lan_ip(),
+        .ip = ml->stun_public_ip,
+        .port = ml->stun_public_port,
+        .port6 = ml->stun_public_port6,
+        .preferred_derp = ml->preferred_derp,
+        .nat_checked = ml->stun_nat_checked,
+        .mapping_varies = ml->nat_mapping_varies,
+    };
+    memcpy(ml->endpoints_told.ip6, ml->stun_public_ip6, 16);
 
     ESP_LOGI(TAG, "Endpoint update sent on H2 stream %lu", (unsigned long)sid);
     /* Response body is discarded — server may send empty response or
@@ -2460,7 +2501,8 @@ void ml_coord_task(void *arg) {
 
     coord_state_t state = COORD_IDLE;
     ml_coord_cmd_t cmd;
-    uint64_t last_activity_ms = ml_get_time_ms();
+    uint64_t last_activity_ms = ml_get_time_ms();  /* last heard from the server */
+    uint64_t last_stun_ms = 0;
     int reconnect_attempts = 0;
 
     /* Noise protocol state - owned exclusively by this task */
@@ -2523,6 +2565,7 @@ void ml_coord_task(void *arg) {
             ml->stun_retry_count = 1;  /* First probe counts as attempt 1 */
             ml->stun_using_fallback = false;
             ml->stun_last_probe_ms = ml_get_time_ms();
+            last_stun_ms = ml->stun_last_probe_ms;
             /* Send first probe to Tailscale STUN primary (IPv4) */
             if (ml->stun_primary_ip) {
                 ml_stun_send_probe_to(ml, ml->stun_primary_ip, ML_STUN_PRIMARY_PORT);
@@ -2551,6 +2594,7 @@ void ml_coord_task(void *arg) {
                 break;
             }
             ml->h2_next_stream_id = 7;  /* Reset H2 stream counter for new connection */
+            ml->endpoints_told.valid = false;  /* a new connection is told them all */
             state = COORD_NOISE_HANDSHAKE;
             break;
 
@@ -2712,19 +2756,6 @@ void ml_coord_task(void *arg) {
                 do_send_endpoint_update(ml, &noise);
             }
 
-            /* Send initial HTTP/2 PING immediately to keep connection active
-             * before the periodic 5s timer kicks in (server has ~20s idle timeout) */
-            {
-                uint8_t ping_frame[17];
-                ping_frame[0] = 0x00; ping_frame[1] = 0x00; ping_frame[2] = 0x08;
-                ping_frame[3] = 0x06; ping_frame[4] = 0x00;
-                ping_frame[5] = 0x00; ping_frame[6] = 0x00;
-                ping_frame[7] = 0x00; ping_frame[8] = 0x00;
-                memset(ping_frame + 9, 0x42, 8);
-                noise_send(ml, &noise, ping_frame, sizeof(ping_frame));
-                ESP_LOGI(TAG, "Sent initial HTTP/2 PING after long-poll");
-            }
-
             state = COORD_LONG_POLL;
             ml->state = ML_STATE_CONNECTED;
             reconnect_attempts = 0;
@@ -2740,9 +2771,11 @@ void ml_coord_task(void *arg) {
             {
                 uint64_t now = ml_get_time_ms();
 
-                /* Check control plane watchdog (120s) */
+                /* Nothing from the server, keep-alives included, for two of
+                 * them: the connection is gone, whatever a send would say */
                 if (now - last_activity_ms > ml->t_ctrl_watchdog_ms) {
-                    ESP_LOGW(TAG, "Control plane watchdog timeout");
+                    ESP_LOGW(TAG, "Nothing from the control plane for %lu s; reconnecting",
+                             (unsigned long)((now - last_activity_ms) / 1000));
                     state = COORD_RECONNECTING;
                     break;
                 }
@@ -2820,8 +2853,14 @@ void ml_coord_task(void *arg) {
                         xEventGroupSetBits(ml->events, ML_EVT_STUN_COMPLETE);
                         /* Send endpoint update to control plane immediately.
                          * With Version >= 68, Stream=true MapRequests have endpoints
-                         * IGNORED, so we need this separate Stream=false request. */
-                        do_send_endpoint_update(ml, &noise);
+                         * IGNORED, so we need this separate Stream=false request.
+                         * Only with something new in it: each one is also passed
+                         * on to every peer. */
+                        if (endpoints_are_news(ml)) {
+                            do_send_endpoint_update(ml, &noise);
+                        } else {
+                            ESP_LOGD(TAG, "Endpoints unchanged; no update");
+                        }
                     }
                     free(stun_pkt.data);
                 }
@@ -2850,9 +2889,15 @@ void ml_coord_task(void *arg) {
                     }
                 }
 
-                /* Periodic STUN re-probe (every 23s) — fresh probe sequence */
-                static uint64_t last_stun_ms = 0;
-                if (now - last_stun_ms > ml->t_stun_interval_ms) {
+                /* Periodic STUN re-probe — fresh probe sequence. While a
+                 * session is in use, often enough to hold the NAT's mapping
+                 * (every 20 to 26 s in tailscaled, under a common 30 s UDP
+                 * timeout), and at once when one comes into use. Otherwise
+                 * only to notice the public address move: tailscaled stops
+                 * altogether. */
+                uint32_t stun_every = ml->session_in_use ? ml->t_stun_interval_ms
+                                                         : ML_STUN_IDLE_INTERVAL_MS;
+                if (now - last_stun_ms > stun_every) {
                     ml->stun_retry_count = 1;
                     ml->stun_using_fallback = false;
                     ml->stun_last_probe_ms = now;
@@ -2875,25 +2920,10 @@ void ml_coord_task(void *arg) {
                     last_stun_ms = now;
                 }
 
-                /* Periodic DERP NotePreferred keepalive (every 60s) */
-                static uint64_t last_derp_keepalive_ms = 0;
-                if (ml->derp.connected && now - last_derp_keepalive_ms > 60000) {
-                    uint8_t preferred = 0x01;
-                    uint8_t *ka_data = malloc(1);
-                    if (ka_data) {
-                        *ka_data = preferred;
-                        ml_derp_tx_item_t ka_item = {
-                            .data = ka_data,
-                            .len = 1,
-                            .frame_type = 0x07,  /* NotePreferred */
-                        };
-                        memset(ka_item.dest_pubkey, 0, 32);
-                        if (xQueueSend(ml->derp_tx_queue, &ka_item, 0) != pdTRUE) {
-                            free(ka_data);
-                        }
-                    }
-                    last_derp_keepalive_ms = now;
-                }
+                /* DERP's NotePreferred goes once, as it connects (ml_derp.c):
+                 * its one connection is to the home region, which does not
+                 * change while it is up. The server keeps the connection
+                 * alive; ml_derp.c notices when it does not. */
 
                 /* Key expiry check (every 60s) — re-register if expired */
                 if (ml->key_expiry_epoch > 0 || ml->key_expired) {
@@ -2916,31 +2946,11 @@ void ml_coord_task(void *arg) {
                     }
                 }
 
-                /* Send HTTP/2 PING every 5 seconds to keep control plane alive.
-                 * The server has a ~20s idle timeout; PINGs maintain bidirectional
-                 * activity and are what actually keep us "online". (v1 reference) */
-                static uint64_t last_h2_ping_ms = 0;
-                if (now - last_h2_ping_ms >= 5000) {
-                    uint8_t ping_frame[17];
-                    ping_frame[0] = 0x00; ping_frame[1] = 0x00; ping_frame[2] = 0x08;
-                    ping_frame[3] = 0x06;  /* Type: PING */
-                    ping_frame[4] = 0x00;  /* Flags: none */
-                    ping_frame[5] = 0x00; ping_frame[6] = 0x00;
-                    ping_frame[7] = 0x00; ping_frame[8] = 0x00;  /* Stream 0 */
-                    /* Opaque 8-byte payload (timestamp for identification) */
-                    uint64_t ping_id = now;
-                    for (int b = 0; b < 8; b++)
-                        ping_frame[9 + b] = (ping_id >> (56 - b * 8)) & 0xFF;
-                    int ping_ret = noise_send(ml, &noise, ping_frame, sizeof(ping_frame));
-                    if (ping_ret >= 0) {
-                        last_h2_ping_ms = now;
-                        last_activity_ms = now;
-                    } else {
-                        ESP_LOGW(TAG, "H2 PING send failed, reconnecting");
-                        state = COORD_RECONNECTING;
-                        break;
-                    }
-                }
+                /* No PING of our own: the long poll asked for keep-alives
+                 * (KeepAlive), which the server sends about once a minute,
+                 * and what it sends is what keeps us online. A PING every
+                 * 5 s, which also fed the watchdog, kept a mobile modem from
+                 * ever resting. tailscaled sends none either. */
 
                 /* Poll for streaming MapResponse updates */
                 int poll_ret = poll_map_update(ml, &noise);

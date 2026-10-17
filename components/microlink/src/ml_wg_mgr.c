@@ -390,6 +390,16 @@ static int find_peer_by_ip(microlink_t *ml, uint32_t vpn_ip) {
     return -1;
 }
 
+/* Whether the peer's session is in use (ML_DISCO_SESSION_ACTIVE_MS). Only
+ * then is a direct path looked for or kept, as tailscaled pings a peer only
+ * while it sends to it: probing every peer every 15 s, used or not, kept a
+ * mobile modem from ever resting. */
+static bool peer_in_use(microlink_t *ml, const ml_peer_t *p) {
+    if (!ml->wg_netif || p->wg_peer_index < 0) return false;
+    return wireguardif_peer_idle_ms((struct netif *)ml->wg_netif, (u8_t)p->wg_peer_index)
+           < ML_DISCO_SESSION_ACTIVE_MS;
+}
+
 static int find_peer_by_disco_key(microlink_t *ml, const uint8_t *disco_key) {
     for (int i = 0; i < ml->peer_count; i++) {
         if (ml->peers[i].active && memcmp(ml->peers[i].disco_key, disco_key, 32) == 0) {
@@ -574,10 +584,15 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     /* Persist to NVS for fast boot next time */
     ml_peer_nvs_save(p);
 
+    /* A direct path is looked for only while the session is in use: a peer
+     * just added has no session, and is probed once one is in use; one
+     * updated while in use is probed again now, its DISCO state reset above. */
+    bool in_use = peer_in_use(ml, p);
+
     /* Send CallMeMaybe to trigger peer-initiated handshake (NAT traversal).
      * Skip on cellular: our endpoints are behind carrier-grade NAT and
      * unreachable — all traffic goes through DERP relay. */
-    if (!ml_at_socket_is_ready()) {
+    if (in_use && !ml_at_socket_is_ready()) {
         disco_send_call_me_maybe(ml, idx);
     }
 
@@ -586,7 +601,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
      * the periodic probe (every 15s) will handle the rest.
      * Skip on cellular: direct probes fill DERP TX queue (~0.6s each on AT socket),
      * blocking time-critical WG handshake responses. */
-    if (!ml_at_socket_is_ready()) {
+    if (in_use && !ml_at_socket_is_ready()) {
         static uint64_t last_burst_ms = 0;
         static int burst_count = 0;
         uint64_t add_now = ml_get_time_ms();
@@ -1411,6 +1426,7 @@ static int disco_probe_start_idx = 0;
 static void disco_periodic_probes(microlink_t *ml) {
     uint64_t now = ml_get_time_ms();
     int upgrade_probes_sent = 0;
+    bool any_in_use = false;
 
     /* Rotate start index so we don't always process peers in the same order */
     int start = disco_probe_start_idx;
@@ -1425,16 +1441,25 @@ static void disco_periodic_probes(microlink_t *ml) {
          * Inbound DISCO pings from any peer are still answered (don't break remote). */
         bool peer_allowed = ml_config_peer_is_allowed(
             ml->config_httpd, p->vpn_ip);
+        bool in_use = peer_in_use(ml, p);
+        any_in_use |= in_use;
 
         /* Check if direct path trust has expired (always runs, not throttled) */
         if (p->has_direct_path && now > p->trust_until_ms) {
             ESP_LOGI(TAG, "Direct path to %s expired, reverting to DERP", p->hostname);
             p->has_direct_path = false;
 
-            /* Only do DERP fallback + re-probe for allowed peers.
-             * Non-allowed peers just get their state cleaned above. */
-            if (peer_allowed) {
-                /* Re-initiate DERP handshake only if we have an active WG session. */
+            if (!in_use) {
+                /* Idle, the heartbeat stopped, which is why. No handshake
+                 * for it: should the session be used again, it goes through
+                 * DERP until DISCO finds the direct path again. */
+                if (ml->wg_netif && p->wg_peer_index >= 0) {
+                    wireguardif_use_derp((struct netif *)ml->wg_netif, (u8_t)p->wg_peer_index);
+                }
+            } else if (peer_allowed) {
+                /* Only do DERP fallback + re-probe for allowed peers.
+                 * Non-allowed peers just get their state cleaned above.
+                 * Re-initiate DERP handshake only if we have an active WG session. */
                 if (ml->wg_netif && p->wg_peer_index >= 0) {
                     struct netif *netif = (struct netif *)ml->wg_netif;
                     err_t is_up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
@@ -1453,6 +1478,9 @@ static void disco_periodic_probes(microlink_t *ml) {
         }
 
         if (!peer_allowed) continue;
+
+        /* Neither probes nor heartbeats for a session not in use */
+        if (!in_use) continue;
 
         /* Probe for direct path upgrade (every UPGRADE_INTERVAL when on DERP).
          * Skip on cellular: direct paths impossible through carrier-grade NAT.
@@ -1475,6 +1503,8 @@ static void disco_periodic_probes(microlink_t *ml) {
             disco_send_ping_to_peer(ml, i, true);
         }
     }
+
+    ml->session_in_use = any_in_use;
 
     /* Advance rotating start index for next call */
     disco_probe_start_idx = (start + DISCO_PROBES_PER_TICK) % (ml->peer_count > 0 ? ml->peer_count : 1);
@@ -1574,10 +1604,10 @@ void ml_wg_mgr_task(void *arg) {
             derp_was_connected = derp_connected_now;
         }
 
-        /* After STUN completes, broadcast CallMeMaybe to all peers.
-         * Peers need to know our public endpoint (from STUN) to send direct
-         * probes. Without this, our initial CMMs during peer-add have 0
-         * endpoints because STUN hasn't finished yet. */
+        /* After STUN completes, send CallMeMaybe to the peers whose session
+         * is in use, which a CMM at peer-add had no public endpoint for.
+         * Others learn it from the control plane, and hear a CMM when a
+         * session to them starts (ml_wg_mgr_send_cmm). */
         if (!stun_cmm_sent && !ml_at_socket_is_ready() &&
             ml->stun_public_ip != 0 && ml->peer_count > 0) {
             stun_cmm_sent = true;
@@ -1585,6 +1615,7 @@ void ml_wg_mgr_task(void *arg) {
             for (int i = 0; i < ml->peer_count; i++) {
                 if (!ml->peers[i].active) continue;
                 if (ml->peers[i].has_direct_path) continue;
+                if (!peer_in_use(ml, &ml->peers[i])) continue;
                 disco_send_call_me_maybe(ml, i);
                 cmm_count++;
             }

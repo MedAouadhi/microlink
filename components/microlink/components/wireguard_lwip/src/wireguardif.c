@@ -343,6 +343,32 @@ bool wireguardif_take_wants_session(struct netif *netif, u8_t peer_index) {
 	return wants;
 }
 
+uint32_t wireguardif_peer_idle_ms(struct netif *netif, u8_t peer_index) {
+	struct wireguard_peer *peer;
+	if (!netif || !netif->state || wireguardif_lookup_peer(netif, peer_index, &peer) != ERR_OK) {
+		return UINT32_MAX;
+	}
+	uint32_t now = wireguard_sys_now();
+	uint32_t idle = UINT32_MAX;
+	if (peer->last_tx != 0) {
+		idle = now - peer->last_tx;
+	}
+	if (peer->last_rx != 0 && now - peer->last_rx < idle) {
+		idle = now - peer->last_rx;
+	}
+	return idle;
+}
+
+err_t wireguardif_use_derp(struct netif *netif, u8_t peer_index) {
+	struct wireguard_peer *peer;
+	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
+	if (result == ERR_OK) {
+		ip_addr_set_any(false, &peer->ip);
+		peer->port = 0;
+	}
+	return result;
+}
+
 // This is used as the output function for the Wireguard netif
 // The ipaddr here is the one inside the VPN which we use to lookup the correct peer/endpoint
 static err_t wireguardif_output(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr) {
