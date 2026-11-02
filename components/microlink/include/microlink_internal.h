@@ -79,6 +79,16 @@ extern "C" {
  * two of them the connection is gone (derp.KeepAlive, and the 120 s read
  * deadline of Tailscale's own DERP client) */
 #define ML_DERP_RECV_TIMEOUT_MS 120000
+/* A relay delivers only to clients connected to it, so a packet for a peer
+ * whose home region is not ours goes over a connection to that region,
+ * opened as it is needed, as Tailscale's client does (magicsock's
+ * derpWriteChanForRegion). At most this many at once besides the home one;
+ * each is closed once nothing has been sent on it for a minute
+ * (derpInactiveCleanupTime), and a region that could not be reached is not
+ * tried again for ML_DERP_AUX_RETRY_MS. */
+#define ML_DERP_AUX_MAX         2
+#define ML_DERP_AUX_IDLE_MS     60000
+#define ML_DERP_AUX_RETRY_MS    10000
 
 /* Tailscale control plane */
 #define ML_CTRL_HOST            "controlplane.tailscale.com"
@@ -223,6 +233,7 @@ typedef struct {
     uint8_t *data;              /* Heap-allocated payload (caller frees on failure) */
     size_t len;                 /* Payload length */
     uint8_t frame_type;         /* DERP frame type (0x04 = SendPacket) */
+    uint16_t region;            /* the peer's home DERP region; 0: ours */
 } ml_derp_tx_item_t;
 
 /* Received packet (from net_io to disco/wg queues) */
@@ -366,6 +377,8 @@ typedef struct {
     mbedtls_ssl_config ssl_conf;
     bool connected;
     uint64_t last_recv_ms;          /* For keepalive watchdog */
+    uint16_t region;                /* the region it is to; 0: the home one before the map */
+    uint64_t last_send_ms;          /* an extra connection closes once idle */
 } ml_derp_conn_t;
 
 /* The endpoints and NetInfo an endpoint update carried */
@@ -440,6 +453,9 @@ struct microlink_s {
     /* DERP connection (owned exclusively by DERP I/O task after connect) */
     /* Connection setup by coord task, then handed to DERP I/O task */
     ml_derp_conn_t derp;
+    /* Connections to peers' home regions other than ours (DERP I/O task
+     * only): see ML_DERP_AUX_MAX */
+    ml_derp_conn_t derp_aux[ML_DERP_AUX_MAX];
 
     /* Sockets for net_io select() loop */
     int disco_sock4;                    /* UDP socket for DISCO + direct WG */
