@@ -249,7 +249,13 @@ typedef struct {
         ML_PEER_ADD,
         ML_PEER_REMOVE,
         ML_PEER_UPDATE_ENDPOINT,
+        ML_PEER_SET_ONLINE,     /* node_id is online, or not */
     } action;
+    /* The control plane's id for the node (tailcfg.Node.ID), which
+     * OnlineChange and PeersChangedPatch name it by; 0 if not given */
+    int64_t node_id;
+    /* tailcfg.Node.Online: 1 online, 0 offline, -1 not said */
+    int8_t online;
     uint32_t vpn_ip;
     uint8_t public_key[32];
     uint8_t disco_key[32];
@@ -275,6 +281,8 @@ typedef struct {
     uint8_t disco_key[32];
     char hostname[64];
     bool active;
+    int64_t node_id;            /* the control plane's id; 0 until a netmap gives it */
+    bool online;                /* as the control plane last said */
 
     /* Endpoints */
     struct {

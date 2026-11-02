@@ -1213,6 +1213,19 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
  * State: FETCH_PEERS - Send MapRequest, parse MapResponse
  * ========================================================================== */
 
+/* Tell wg_mgr that a node came online or went. */
+static void queue_online(microlink_t *ml, int64_t node_id, bool online) {
+    if (node_id == 0) return;
+    ml_peer_update_t *update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
+    if (!update) return;
+    update->action = ML_PEER_SET_ONLINE;
+    update->node_id = node_id;
+    update->online = online ? 1 : 0;
+    if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
+        free(update);
+    }
+}
+
 static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     /* Try all field names used by Tailscale (copied from v1 lines 3176-3184):
      *   "Peers"        - Full peer list (initial Stream=false response)
@@ -1242,6 +1255,13 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
         if (!update) continue;
 
         update->action = ML_PEER_ADD;
+
+        /* The node's id, which online changes name it by, and whether it is
+         * online: Tailscale lists offline peers too. */
+        cJSON *node_id = cJSON_GetObjectItem(peer, "ID");
+        update->node_id = cJSON_IsNumber(node_id) ? (int64_t)node_id->valuedouble : 0;
+        cJSON *online = cJSON_GetObjectItem(peer, "Online");
+        update->online = cJSON_IsBool(online) ? (cJSON_IsTrue(online) ? 1 : 0) : -1;
 
         /* Hostname */
         cJSON *name = cJSON_GetObjectItem(peer, "Name");
@@ -1333,6 +1353,31 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     }
 
 check_removed:
+    /* OnlineChange: {"<node id>": true|false}, a long-poll's word that a
+     * peer came online or went. */
+    cJSON *online_change = cJSON_GetObjectItem(root, "OnlineChange");
+    if (online_change && cJSON_IsObject(online_change)) {
+        cJSON *change;
+        cJSON_ArrayForEach(change, online_change) {
+            if (!change->string || !cJSON_IsBool(change)) continue;
+            queue_online(ml, strtoll(change->string, NULL, 10), cJSON_IsTrue(change));
+        }
+    }
+    /* PeersChangedPatch, as Tailscale sends it, is an array of PeerChange
+     * objects named by NodeID; the object form handled below is keyed by
+     * node key. Only Online is taken from the array form. */
+    cJSON *patch_list = cJSON_GetObjectItem(root, "PeersChangedPatch");
+    if (patch_list && cJSON_IsArray(patch_list)) {
+        cJSON *change;
+        cJSON_ArrayForEach(change, patch_list) {
+            cJSON *id = cJSON_GetObjectItem(change, "NodeID");
+            cJSON *on = cJSON_GetObjectItem(change, "Online");
+            if (cJSON_IsNumber(id) && cJSON_IsBool(on)) {
+                queue_online(ml, (int64_t)id->valuedouble, cJSON_IsTrue(on));
+            }
+        }
+    }
+
     /* Handle PeersRemoved — array of nodekey strings (long-poll delta updates) */
     cJSON *removed = cJSON_GetObjectItem(root, "PeersRemoved");
     if (removed && cJSON_IsArray(removed)) {

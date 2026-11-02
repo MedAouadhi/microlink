@@ -418,6 +418,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
 
     /* Check if peer already exists */
     int idx = find_peer_by_key(ml, update->public_key);
+    bool found = idx >= 0;
     if (idx >= 0) {
         ESP_LOGI(TAG, "Updating existing peer %s (idx=%d)", update->hostname, idx);
     } else {
@@ -478,6 +479,16 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->hostname[sizeof(p->hostname) - 1] = '\0';
     p->derp_region = update->derp_region;
     p->active = true;
+    if (update->node_id != 0) {
+        p->node_id = update->node_id;
+    }
+    /* A netmap that says nothing of it leaves it as it was, and a new peer
+     * online: what every peer was before this was kept. */
+    if (update->online >= 0) {
+        p->online = update->online == 1;
+    } else if (!found) {
+        p->online = true;
+    }
 
     /* Copy endpoints */
     p->endpoint_count = update->endpoint_count;
@@ -662,6 +673,19 @@ static void process_peer_updates(microlink_t *ml) {
             break;
         case ML_PEER_REMOVE:
             remove_peer(ml, update);
+            break;
+        case ML_PEER_SET_ONLINE:
+            for (int i = 0; i < ml->peer_count; i++) {
+                ml_peer_t *p = &ml->peers[i];
+                if (p->active && p->node_id == update->node_id) {
+                    if (p->online != (update->online == 1)) {
+                        ESP_LOGI(TAG, "Peer %s is %s", p->hostname,
+                                 update->online == 1 ? "online" : "offline");
+                    }
+                    p->online = update->online == 1;
+                    break;
+                }
+            }
             break;
         case ML_PEER_UPDATE_ENDPOINT:
             /* Update endpoint/DERP for existing peer (delta patch) */
